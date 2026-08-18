@@ -15,7 +15,8 @@
 #
 set -Eeuo pipefail
 
-readonly VERSION="1.0.0"
+# Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
+readonly BOOTSTRAP_VERSION="1.0.1"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -37,7 +38,9 @@ else
     C_BOLD=""; C_DIM=""
 fi
 
-log()      { printf '%s\n' "$*" | tee -a "$LOG_FILE" >/dev/null; }
+# Лог не должен ронять вызывающего: до проверки на root файл в /var/log
+# недоступен на запись, а err() вызывается как раз в этот момент.
+log()      { printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 info()     { printf '%s→%s %s\n' "$C_BLUE" "$C_RESET" "$*"; log "[INFO] $*"; }
 ok()       { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; log "[ OK ] $*"; }
 warn()     { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; log "[WARN] $*"; }
@@ -116,6 +119,15 @@ should_run() {
 # ─────────────────────────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Число ключей в authorized_keys. Считаем через ssh-keygen, а не grep:
+# он понимает и строки с опциями (restrict,command="..." ssh-ed25519 ...),
+# и FIDO-типы (sk-ssh-ed25519@openssh.com). Всегда печатает число.
+count_keys() {
+    local f="$1"
+    [[ -f "$f" ]] || { printf '0'; return 0; }
+    { ssh-keygen -l -f "$f" 2>/dev/null || true; } | grep -c . || true
+}
+
 backup_file() {
     local f="$1"
     [[ -f "$f" ]] || return 0
@@ -168,11 +180,16 @@ preflight() {
     ok "Запущено от root"
 
     [[ -r /etc/os-release ]] || die "Не найден /etc/os-release"
+    # Сорсим в субшелле: os-release определяет VERSION, NAME и прочие общие
+    # имена, и в основном шелле они затирали бы наши переменные.
+    local os_id os_like os_name
     # shellcheck disable=SC1091
-    . /etc/os-release
-    case "${ID:-}${ID_LIKE:-}" in
-        *debian*|*ubuntu*) ok "ОС: ${PRETTY_NAME:-$ID}" ;;
-        *) die "Поддерживаются только Debian и Ubuntu. Обнаружено: ${PRETTY_NAME:-$ID}" ;;
+    os_id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}") || os_id=""
+    os_like=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}") || os_like=""
+    os_name=$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-}") || os_name=""
+    case "${os_id}${os_like}" in
+        *debian*|*ubuntu*) ok "ОС: ${os_name:-$os_id}" ;;
+        *) die "Поддерживаются только Debian и Ubuntu. Обнаружено: ${os_name:-${os_id:-неизвестно}}" ;;
     esac
 
     if [[ "$(uname -m)" != "x86_64" && "$(uname -m)" != "aarch64" ]]; then
@@ -182,6 +199,18 @@ preflight() {
     mkdir -p "$STATE_DIR" "$BACKUP_DIR"
     touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
     ok "Лог: $LOG_FILE"
+
+    # На минимальном образе Debian curl не предустановлен, а проверки ниже
+    # (и public_ip) без него молча превращаются в «нет сети».
+    if ! have curl; then
+        warn "curl не установлен — ставлю, он нужен для проверок ниже"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq \
+            && apt-get install -y -qq curl ca-certificates >/dev/null \
+            || die "Не удалось установить curl — проверьте apt и сеть"
+        have curl || die "curl не появился после установки"
+        ok "curl установлен"
+    fi
 
     if ! ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
         warn "ICMP до 1.1.1.1 не проходит (может быть заблокирован хостером)."
@@ -281,7 +310,7 @@ step_ssh() {
     touch "$akfile"; chmod 600 "$akfile"
 
     local existing=0
-    existing=$(grep -cE '^(ssh|ecdsa)-' "$akfile" 2>/dev/null || echo 0)
+    existing=$(count_keys "$akfile")
     if (( existing > 0 )); then
         ok "В authorized_keys уже есть ключей: $existing"
         ssh-keygen -l -f "$akfile" 2>/dev/null | sed 's/^/    /' || true
@@ -317,8 +346,8 @@ step_ssh() {
     chmod 700 "$HOME/.ssh"; chmod 600 "$akfile"
     ok "Права выставлены: ~/.ssh = 700, authorized_keys = 600"
 
-    local nkeys; nkeys=$(grep -cE '^(ssh|ecdsa)-' "$akfile" 2>/dev/null || echo 0)
-    if (( nkeys == 0 )); then
+    local nkeys; nkeys=$(count_keys "$akfile")
+    if [[ ! "$nkeys" =~ ^[0-9]+$ ]] || (( nkeys == 0 )); then
         warn "Ключей нет — отключать пароль нельзя, пропускаю харденинг."
         state_mark "ssh"; return 0
     fi
@@ -570,9 +599,11 @@ prepare_acme() {
         ok "acme.sh уже установлен: $acme_home"
     else
         info "Ставлю acme.sh с e-mail $email..."
+        # Не die: вызывающий (step_selfsteal) рассчитывает пережить неудачу
+        # и перейти к следующему шагу, а die убил бы весь скрипт.
         curl -fsSL https://get.acme.sh | sh -s email="$email" >>"$LOG_FILE" 2>&1 \
-            || die "Установка acme.sh не удалась, смотрите $LOG_FILE"
-        [[ -f "$acme_home/acme.sh" ]] || die "acme.sh не найден после установки"
+            || { err "Установка acme.sh не удалась, смотрите $LOG_FILE"; return 1; }
+        [[ -f "$acme_home/acme.sh" ]] || { err "acme.sh не найден после установки"; return 1; }
         ok "acme.sh установлен"
     fi
 
@@ -764,7 +795,7 @@ JSON
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
     clear 2>/dev/null || true
-    printf '\n%s%s  remnanode-bootstrap v%s%s\n' "$C_BOLD" "$C_CYAN" "$VERSION" "$C_RESET"
+    printf '\n%s%s  remnanode-bootstrap v%s%s\n' "$C_BOLD" "$C_CYAN" "$BOOTSTRAP_VERSION" "$C_RESET"
     printf '%s  Интерактивная установка Remnawave-ноды%s\n' "$C_DIM" "$C_RESET"
 
     preflight

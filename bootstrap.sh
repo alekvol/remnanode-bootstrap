@@ -10,6 +10,7 @@
 #   5. Remnanode
 #   6. Selfsteal (nginx + unix socket)
 #   7. WARP, вариант B (host-интерфейс)
+#   8. Файрвол (ufw)
 #
 # Запуск от root, одной командой:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
@@ -20,7 +21,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.0.2"
+readonly BOOTSTRAP_VERSION="1.1.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -247,7 +248,7 @@ preflight() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_system() {
     should_run "system" "Подготовка системы" || return 0
-    banner "Шаг 1/7 — Подготовка системы"
+    banner "Шаг 1/8 — Подготовка системы"
 
     info "Обновляю списки пакетов..."
     export DEBIAN_FRONTEND=noninteractive
@@ -306,7 +307,7 @@ sshd_effective() { sshd -T 2>/dev/null | grep -iE "^$1 " | awk '{print $2}'; }
 
 step_ssh() {
     should_run "ssh" "Настройка SSH" || return 0
-    banner "Шаг 2/7 — Вход по SSH-ключу"
+    banner "Шаг 2/8 — Вход по SSH-ключу"
 
     printf '%sВ Termius: Keychain → New Key → Generate, тип ED25519.%s\n' "$C_DIM" "$C_RESET"
     printf '%sЗатем откройте ключ и скопируйте ПУБЛИЧНУЮ часть (ssh-ed25519 AAAA...).%s\n\n' "$C_DIM" "$C_RESET"
@@ -446,7 +447,7 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 step_tailscale() {
     should_run "tailscale" "Tailscale" || return 0
-    banner "Шаг 3/7 — Tailscale"
+    banner "Шаг 3/8 — Tailscale"
 
     if ! ask_yn "Установить Tailscale?" y; then
         info "Пропускаю."; return 0
@@ -492,7 +493,7 @@ step_tailscale() {
 # Шаг 4. Домен
 # ─────────────────────────────────────────────────────────────────────────────
 step_dns() {
-    banner "Шаг 4/7 — A-запись домена"
+    banner "Шаг 4/8 — A-запись домена"
 
     printf '%sSelfsteal выпускает сертификат Let'"'"'s Encrypt через TLS-ALPN на 443.%s\n' "$C_DIM" "$C_RESET"
     printf '%sДля этого домен ОБЯЗАН резолвиться в IP этого сервера.%s\n\n' "$C_DIM" "$C_RESET"
@@ -541,7 +542,7 @@ step_dns() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_remnanode() {
     should_run "remnanode" "Remnanode" || return 0
-    banner "Шаг 5/7 — Установка Remnanode"
+    banner "Шаг 5/8 — Установка Remnanode"
 
     if have docker; then
         ok "Docker уже есть: $(docker --version)"
@@ -638,7 +639,7 @@ prepare_acme() {
 
 step_selfsteal() {
     should_run "selfsteal" "Selfsteal" || return 0
-    banner "Шаг 6/7 — Selfsteal (nginx + unix socket)"
+    banner "Шаг 6/8 — Selfsteal (nginx + unix socket)"
 
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
     [[ -n "$DOMAIN" ]] || die "Домен не задан — сначала пройдите шаг 4"
@@ -700,7 +701,7 @@ step_selfsteal() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_warp() {
     should_run "warp" "WARP" || return 0
-    banner "Шаг 7/7 — WARP (вариант B, host-интерфейс)"
+    banner "Шаг 7/8 — WARP (вариант B, host-интерфейс)"
 
     printf '%sВариант B привязывает сокеты Xray к kernel-интерфейсу wg-quick@warp%s\n' "$C_DIM" "$C_RESET"
     printf '%sчерез sockopt.interface. Быстрее варианта A, ключи не попадают в конфиг Xray.%s\n\n' "$C_DIM" "$C_RESET"
@@ -751,13 +752,213 @@ step_warp() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Шаг 8. Файрвол
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Порты, на которых реально слушает sshd. Берём из sshd -T, а не из конфига:
+# порт мог быть переопределён дропином, а закрыться от себя нельзя.
+ssh_ports() {
+    local p
+    p=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
+    [[ -n "$p" ]] || p=22
+    printf '%s\n' "$p"
+}
+
+# Порт API ноды из .env. Новое имя NODE_PORT, старое APP_PORT.
+node_port() {
+    local env=/opt/remnanode/.env p=""
+    [[ -f "$env" ]] || return 1
+    p=$(grep -m1 -E '^[[:space:]]*(NODE_PORT|APP_PORT)=' "$env" \
+        | cut -d= -f2- | tr -d '"'\''[:space:]')
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$p"
+}
+
+# Контейнеры с опубликованными наружу портами. Docker пишет свои правила
+# в цепочку DOCKER-USER, минуя ufw, поэтому такие порты остаются открытыми
+# даже при deny incoming — про них надо предупредить отдельно.
+docker_published() {
+    have docker || return 0
+    docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+        | grep -E '0\.0\.0\.0:|\[::\]:' || true
+}
+
+step_firewall() {
+    should_run "firewall" "Файрвол" || return 0
+    banner "Шаг 8/8 — Файрвол (ufw)"
+
+    printf '%sНаружу открываются только 22, 80 и 443. Порт ноды доступен%s\n' "$C_DIM" "$C_RESET"
+    printf '%sтолько из тейлнета, снаружи закрыт. Всё исходящее разрешено.%s\n\n' "$C_DIM" "$C_RESET"
+
+    if ! ask_yn "Настроить ufw?" y; then
+        info "Пропускаю."; return 0
+    fi
+
+    if have ufw; then
+        ok "ufw уже установлен"
+    else
+        info "Ставлю ufw..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq ufw >/dev/null || { err "Не удалось поставить ufw"; return 1; }
+        ok "ufw установлен"
+    fi
+
+    # ── Собираем список портов ────────────────────────────────────────────
+    local sshp
+    sshp=$(ssh_ports | tr '\n' ' ')
+    ok "SSH слушает порт(ы): $sshp"
+
+    local nodep=""
+    if nodep=$(node_port); then
+        ok "Порт ноды из /opt/remnanode/.env: $nodep"
+    else
+        warn "Не удалось прочитать порт ноды из /opt/remnanode/.env"
+        ask_var nodep "Порт API ноды (Enter — пропустить правило для тейлнета):" ""
+        [[ "$nodep" =~ ^[0-9]+$ ]] || nodep=""
+    fi
+
+    local ts_if=""
+    if ip link show tailscale0 >/dev/null 2>&1; then
+        ts_if="tailscale0"
+        ok "Интерфейс тейлнета: tailscale0"
+    else
+        warn "Интерфейс tailscale0 не найден — правил для тейлнета не будет"
+        if [[ -n "$nodep" ]]; then
+            err "Порт ноды $nodep останется закрытым для всех, включая панель."
+            ask_yn "  Всё равно продолжить?" n || return 0
+        fi
+    fi
+
+    # ── Область правила для тейлнета ──────────────────────────────────────
+    local ts_wide="n"
+    if [[ -n "$ts_if" ]]; then
+        printf '\n%sДоступ из тейлнета можно открыть двумя способами:%s\n' "$C_DIM" "$C_RESET"
+        dim "  узко — только порт ноды${nodep:+ ($nodep)}; всё остальное закрыто и внутри тейлнета"
+        dim "  широко — любой порт этого сервера доступен вашим устройствам в тейлнете"
+        ask_yn "Открыть тейлнету весь интерфейс (широко)?" n && ts_wide="y"
+    fi
+
+    # ── Входящий 41641/udp ────────────────────────────────────────────────
+    local ts_udp="n"
+    if [[ -n "$ts_if" ]]; then
+        printf '\n%sTailscale слушает UDP 41641 для прямых соединений между пирами.%s\n' "$C_DIM" "$C_RESET"
+        dim "Закрыть можно: связь сохранится, но при неудачной пробивке NAT"
+        dim "трафик пойдёт через DERP-релеи — лишняя задержка и чужой сервер в пути."
+        dim "Риска в открытом порте нет: там WireGuard, чужой пакет отбрасывается."
+        ask_yn "Разрешить входящий 41641/udp?" y && ts_udp="y"
+    fi
+
+    # ── План ──────────────────────────────────────────────────────────────
+    printf '\n%sБудут применены правила:%s\n' "$C_BOLD" "$C_RESET"
+    dim "default deny incoming / allow outgoing"
+    local p
+    for p in $sshp; do dim "allow $p/tcp                      (SSH)"; done
+    dim "allow 80/tcp                       (HTTP, выпуск сертификата)"
+    dim "allow 443/tcp                      (VLESS REALITY, selfsteal)"
+    if [[ -n "$ts_if" ]]; then
+        if [[ "$ts_wide" == "y" ]]; then
+            dim "allow in on tailscale0             (весь тейлнет)"
+        elif [[ -n "$nodep" ]]; then
+            dim "allow in on tailscale0 port $nodep    (только API ноды)"
+        fi
+        [[ "$ts_udp" == "y" ]] && dim "allow 41641/udp                    (прямые соединения Tailscale)"
+    fi
+    printf '\n'
+
+    warn "Вы сейчас подключены по SSH. Правило для порта $sshp добавляется ДО включения."
+    ask_yn "Применить?" y || { info "Отменено."; return 0; }
+
+    # ── Применение ────────────────────────────────────────────────────────
+    # Порядок важен: сначала SSH, потом всё остальное, включение — последним.
+    for p in $sshp; do
+        ufw allow "$p"/tcp comment 'ssh' >/dev/null || { err "Не удалось добавить правило для SSH — не включаю ufw"; return 1; }
+    done
+    ok "SSH разрешён: $sshp"
+
+    ufw default deny incoming  >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw allow 80/tcp  comment 'http acme'   >/dev/null
+    ufw allow 443/tcp comment 'vless reality' >/dev/null
+    ok "Открыты 80 и 443"
+
+    if [[ -n "$ts_if" ]]; then
+        if [[ "$ts_wide" == "y" ]]; then
+            ufw allow in on "$ts_if" comment 'tailnet' >/dev/null
+            ok "Тейлнету открыт весь интерфейс"
+        elif [[ -n "$nodep" ]]; then
+            ufw allow in on "$ts_if" to any port "$nodep" proto tcp comment 'remnanode api' >/dev/null
+            ok "Порт ноды $nodep открыт только на tailscale0"
+        fi
+        if [[ "$ts_udp" == "y" ]]; then
+            ufw allow 41641/udp comment 'tailscale direct' >/dev/null
+            ok "Разрешён входящий 41641/udp"
+        fi
+    fi
+
+    # Проверяем, что правило для SSH действительно в списке. Без него
+    # включение ufw обрывает текущую сессию и запирает нас снаружи.
+    local first_ssh; first_ssh=${sshp%% *}
+    if ! ufw status | grep -qE "^$first_ssh/tcp"; then
+        err "Правило для SSH не появилось в списке — НЕ включаю ufw"
+        ufw status | sed 's/^/    /'
+        return 1
+    fi
+
+    ufw --force enable >/dev/null || { err "ufw enable вернул ошибку"; return 1; }
+    ok "ufw включён"
+
+    # ── Проверка результата ───────────────────────────────────────────────
+    printf '\n'
+    info "Итоговые правила:"
+    ufw status verbose | sed 's/^/    /'
+
+    printf '\n'
+    # || true обязателен: grep -m1 закрывает пайп, ufw ловит SIGPIPE,
+    # pipefail превращает это в ошибку присваивания и роняет скрипт.
+    local policy; policy=$(ufw status verbose | grep -m1 '^Default:' || true)
+    [[ "$policy" == *"deny (incoming)"* ]] \
+        && ok "Политика по умолчанию: входящие запрещены" \
+        || err "Политика по умолчанию не deny incoming: $policy"
+
+    if [[ -n "$nodep" ]]; then
+        # Правило порта ноды обязано быть привязано к интерфейсу. Строка
+        # без "on tailscale0" означает, что порт открыт всему интернету.
+        if ufw status | grep -E "(^|[[:space:]])$nodep(/tcp)?[[:space:]]" | grep -qv 'on tailscale0'; then
+            err "Порт ноды $nodep разрешён не только на tailscale0 — проверьте вывод выше"
+            ufw status | grep -E "(^|[[:space:]])$nodep" | sed 's/^/    /'
+        else
+            ok "Порт ноды $nodep снаружи закрыт"
+        fi
+    fi
+
+    local pub; pub=$(docker_published)
+    if [[ -n "$pub" ]]; then
+        warn "Есть контейнеры с опубликованными портами:"
+        printf '%s\n' "$pub" | sed 's/^/    /'
+        dim "Docker пишет правила в цепочку DOCKER-USER, минуя ufw — такие порты"
+        dim "остаются открытыми снаружи даже при deny incoming. Для ноды это не"
+        dim "проблема, пока контейнер в network_mode: host."
+    else
+        ok "Контейнеров с опубликованными наружу портами нет"
+    fi
+
+    printf '\n'
+    warn "Проверьте вход по SSH из нового окна, не закрывая эту сессию."
+    dim "Снаружи убедиться, что порт ноды закрыт: nmap -Pn -p $nodep <IP сервера>"
+    dim "Откатить всё: ufw disable"
+    pause
+
+    state_mark "firewall"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Итог
 # ─────────────────────────────────────────────────────────────────────────────
 summary() {
     banner "Готово"
 
     printf '%sЧто сделано:%s\n' "$C_BOLD" "$C_RESET"
-    for k in system ssh tailscale dns remnanode selfsteal warp; do
+    for k in system ssh tailscale dns remnanode selfsteal warp firewall; do
         if state_done "$k"; then
             printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$k"
         else
@@ -806,7 +1007,7 @@ main() {
 
     preflight
 
-    printf '\n%sБудут выполнены 7 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
+    printf '\n%sБудут выполнены 8 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
     ask_yn "Начинаем?" y || { info "Отменено."; exit 0; }
 
     step_system
@@ -816,6 +1017,7 @@ main() {
     step_remnanode
     step_selfsteal
     step_warp
+    step_firewall
     summary
 }
 

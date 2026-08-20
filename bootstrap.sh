@@ -11,12 +11,16 @@
 #   6. Selfsteal (nginx + unix socket)
 #   7. WARP, вариант B (host-интерфейс)
 #
-# Запуск:  sudo bash bootstrap.sh
+# Запуск от root, одной командой:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
+#
+# Через пайп (curl | bash) запускать нельзя: bash займёт stdin текстом самого
+# скрипта, и вложенным установщикам не останется канала для диалога.
 #
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.0.1"
+readonly BOOTSTRAP_VERSION="1.0.2"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -176,7 +180,9 @@ run_remote() {
 preflight() {
     banner "Предварительные проверки"
 
-    [[ $EUID -eq 0 ]] || die "Нужен root. Запустите: sudo bash $0"
+    # Не подсказываем sudo: на минимальных образах его нет, а при запуске
+    # через bash <(...) в $0 лежит /dev/fd/63 и совет получился бы бессмысленным.
+    [[ $EUID -eq 0 ]] || die "Нужен root. Зайдите под root и запустите заново."
     ok "Запущено от root"
 
     [[ -r /etc/os-release ]] || die "Не найден /etc/os-release"

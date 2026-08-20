@@ -6,15 +6,37 @@
 
 ## Быстрый старт
 
+От root, одной командой — на минимальном образе, где нет даже `curl`:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh -o bootstrap.sh
-less bootstrap.sh          # прочитайте перед запуском
-sudo bash bootstrap.sh
+apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
 ```
 
-Скрипт не запускается через пайп намеренно: вложенным установщикам нужен stdin для интерактивных вопросов.
+Если `curl` уже стоит, достаточно короткого варианта:
 
-Требования: root (через `sudo`), Debian или Ubuntu, bash 4+. Всё остальное, включая `curl`, скрипт доставит сам.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
+```
+
+Требования: root, Debian или Ubuntu, bash 4+. Всё остальное скрипт доставит сам.
+
+### Если хотите прочитать скрипт перед запуском
+
+Разумная привычка, раз уж он ставит систему от root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh -o bootstrap.sh
+```
+
+```bash
+less bootstrap.sh && bash bootstrap.sh
+```
+
+### Почему `bash <(...)`, а не `curl | bash`
+
+Через пайп скрипт запускать нельзя: bash в этом случае читает его собственный текст со stdin, и вложенным установщикам (`remnanode.sh`, `selfsteal.sh`, `wtm.sh`) не остаётся канала для интерактивных вопросов. Подстановка процесса передаёт скрипт файловым дескриптором и stdin не занимает.
+
+Запускать лучше под `tmux` или `screen`: шаг 2 перезагружает sshd, и обрыв сессии посреди установки лучше пережить.
 
 ## Что проверяется до первого шага
 

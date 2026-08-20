@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.1.0"
+readonly BOOTSTRAP_VERSION="1.1.1"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -166,9 +166,6 @@ run_remote() {
     curl -fsSL --max-time 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "Не удалось скачать $url"; }
     local lines; lines=$(wc -l < "$tmp")
     dim "Получено строк: $lines"
-    if ask_yn "  Просмотреть скрипт перед запуском?" n; then
-        ${PAGER:-less} "$tmp" </dev/tty || true
-    fi
     info "Запускаю: bash $tmp $*"
     bash "$tmp" "$@" </dev/tty
     local rc=$?

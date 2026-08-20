@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.1.2"
+readonly BOOTSTRAP_VERSION="1.1.3"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -992,11 +992,26 @@ step_bbr() {
         info "Пропускаю."; return 0
     fi
 
-    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-        warn "BBR недоступен в этом ядре — пропускаю"
-        dim "Ядро: $(uname -r). Нужен модуль tcp_bbr либо ядро 4.9+."
+    # tcp_available_congestion_control перечисляет только ЗАГРУЖЕННЫЕ
+    # алгоритмы. В Debian и Ubuntu tcp_bbr собран модулем
+    # (CONFIG_TCP_CONG_BBR=m) и сам не подгружается, поэтому до modprobe
+    # список выглядит как «reno cubic» даже там, где BBR прекрасно есть.
+    local avail=/proc/sys/net/ipv4/tcp_available_congestion_control
+    if ! grep -qw bbr "$avail" 2>/dev/null; then
+        info "Подгружаю модуль tcp_bbr..."
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if ! grep -qw bbr "$avail" 2>/dev/null; then
+        warn "BBR недоступен: модуль tcp_bbr не загрузился"
+        dim "Ядро: $(uname -r)"
+        dim "Проверьте: grep TCP_CONG_BBR /boot/config-\$(uname -r)"
+        dim "  =m — модуль есть, но не загружается; =y — встроен; нет строки — не собран"
         return 0
     fi
+    ok "BBR доступен ядру"
+
+    # Чтобы модуль был на месте и после перезагрузки, до применения sysctl.
+    echo tcp_bbr > /etc/modules-load.d/bbr.conf
 
     cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
 net.core.default_qdisc = fq
@@ -1009,8 +1024,21 @@ EOF
     qd=$(sysctl -n net.core.default_qdisc)
     [[ "$cc" == "bbr" ]] && ok "tcp_congestion_control = bbr" || warn "BBR не применился: $cc"
     [[ "$qd" == "fq"  ]] && ok "default_qdisc = fq"          || warn "fq не применился: $qd"
-    dim "На уже поднятых интерфейсах fq вступит в силу после перезагрузки."
-    dim "Сейчас: tc qdisc show dev \$(ip route show default | awk '{print \$5; exit}')"
+
+    # default_qdisc действует на интерфейсы при их создании, поэтому на уже
+    # поднятом останется прежний fq_codel до перезагрузки. Меняем на месте.
+    local dev
+    dev=$(ip route show default | awk '{print $5; exit}')
+    if [[ -n "$dev" ]]; then
+        if tc qdisc replace dev "$dev" root fq 2>/dev/null; then
+            ok "На $dev применён fq без перезагрузки"
+        else
+            warn "Не удалось сменить qdisc на $dev — fq вступит в силу после перезагрузки"
+        fi
+        dim "Сейчас: $(tc qdisc show dev "$dev" 2>/dev/null | head -1)"
+    fi
+
+    dim "Проверить на живых соединениях: ss -tin | grep -c bbr"
 
     state_mark "bbr"
 }

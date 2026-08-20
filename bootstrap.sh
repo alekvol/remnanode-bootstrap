@@ -3,7 +3,7 @@
 # remnanode-bootstrap — интерактивная установка Remnawave-ноды на чистую VPS.
 #
 # Шаги:
-#   1. Подготовка системы (пакеты, BBR)
+#   1. Подготовка системы (пакеты)
 #   2. Вход по SSH-ключу и отключение паролей
 #   3. Tailscale
 #   4. Проверка A-записи домена
@@ -11,6 +11,7 @@
 #   6. Selfsteal (nginx + unix socket)
 #   7. WARP, вариант B (host-интерфейс)
 #   8. Файрвол (ufw)
+#   9. BBR + fq
 #
 # Запуск от root, одной командой:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
@@ -248,7 +249,7 @@ preflight() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_system() {
     should_run "system" "Подготовка системы" || return 0
-    banner "Шаг 1/8 — Подготовка системы"
+    banner "Шаг 1/9 — Подготовка системы"
 
     info "Обновляю списки пакетов..."
     export DEBIAN_FRONTEND=noninteractive
@@ -259,25 +260,6 @@ step_system() {
     info "Ставлю базовые пакеты: ${pkgs[*]}"
     apt-get install -y -qq "${pkgs[@]}" >/dev/null
     ok "Пакеты установлены"
-
-    if ask_yn "Включить BBR + fq?" y; then
-        if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-            cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-            sysctl --system >/dev/null 2>&1
-            local cc qd
-            cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-            qd=$(sysctl -n net.core.default_qdisc)
-            [[ "$cc" == "bbr" ]] && ok "tcp_congestion_control = bbr" || warn "BBR не применился: $cc"
-            [[ "$qd" == "fq"  ]] && ok "default_qdisc = fq"          || warn "fq не применился: $qd"
-            dim "На уже поднятых интерфейсах fq вступит в силу после перезагрузки."
-            dim "Сейчас: tc qdisc show dev \$(ip route show default | awk '{print \$5; exit}')"
-        else
-            warn "BBR недоступен в этом ядре — пропускаю"
-        fi
-    fi
 
     state_mark "system"
 }
@@ -307,7 +289,7 @@ sshd_effective() { sshd -T 2>/dev/null | grep -iE "^$1 " | awk '{print $2}'; }
 
 step_ssh() {
     should_run "ssh" "Настройка SSH" || return 0
-    banner "Шаг 2/8 — Вход по SSH-ключу"
+    banner "Шаг 2/9 — Вход по SSH-ключу"
 
     printf '%sВ Termius: Keychain → New Key → Generate, тип ED25519.%s\n' "$C_DIM" "$C_RESET"
     printf '%sЗатем откройте ключ и скопируйте ПУБЛИЧНУЮ часть (ssh-ed25519 AAAA...).%s\n\n' "$C_DIM" "$C_RESET"
@@ -447,7 +429,7 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 step_tailscale() {
     should_run "tailscale" "Tailscale" || return 0
-    banner "Шаг 3/8 — Tailscale"
+    banner "Шаг 3/9 — Tailscale"
 
     if ! ask_yn "Установить Tailscale?" y; then
         info "Пропускаю."; return 0
@@ -493,7 +475,7 @@ step_tailscale() {
 # Шаг 4. Домен
 # ─────────────────────────────────────────────────────────────────────────────
 step_dns() {
-    banner "Шаг 4/8 — A-запись домена"
+    banner "Шаг 4/9 — A-запись домена"
 
     printf '%sSelfsteal выпускает сертификат Let'"'"'s Encrypt через TLS-ALPN на 443.%s\n' "$C_DIM" "$C_RESET"
     printf '%sДля этого домен ОБЯЗАН резолвиться в IP этого сервера.%s\n\n' "$C_DIM" "$C_RESET"
@@ -542,7 +524,7 @@ step_dns() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_remnanode() {
     should_run "remnanode" "Remnanode" || return 0
-    banner "Шаг 5/8 — Установка Remnanode"
+    banner "Шаг 5/9 — Установка Remnanode"
 
     if have docker; then
         ok "Docker уже есть: $(docker --version)"
@@ -639,7 +621,7 @@ prepare_acme() {
 
 step_selfsteal() {
     should_run "selfsteal" "Selfsteal" || return 0
-    banner "Шаг 6/8 — Selfsteal (nginx + unix socket)"
+    banner "Шаг 6/9 — Selfsteal (nginx + unix socket)"
 
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
     [[ -n "$DOMAIN" ]] || die "Домен не задан — сначала пройдите шаг 4"
@@ -701,7 +683,7 @@ step_selfsteal() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_warp() {
     should_run "warp" "WARP" || return 0
-    banner "Шаг 7/8 — WARP (вариант B, host-интерфейс)"
+    banner "Шаг 7/9 — WARP (вариант B, host-интерфейс)"
 
     printf '%sВариант B привязывает сокеты Xray к kernel-интерфейсу wg-quick@warp%s\n' "$C_DIM" "$C_RESET"
     printf '%sчерез sockopt.interface. Быстрее варианта A, ключи не попадают в конфиг Xray.%s\n\n' "$C_DIM" "$C_RESET"
@@ -785,7 +767,7 @@ docker_published() {
 
 step_firewall() {
     should_run "firewall" "Файрвол" || return 0
-    banner "Шаг 8/8 — Файрвол (ufw)"
+    banner "Шаг 8/9 — Файрвол (ufw)"
 
     printf '%sНаружу открываются только 22, 80 и 443. Порт ноды доступен%s\n' "$C_DIM" "$C_RESET"
     printf '%sтолько из тейлнета, снаружи закрыт. Всё исходящее разрешено.%s\n\n' "$C_DIM" "$C_RESET"
@@ -952,13 +934,50 @@ step_firewall() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Шаг 9. BBR
+# ─────────────────────────────────────────────────────────────────────────────
+step_bbr() {
+    should_run "bbr" "BBR + fq" || return 0
+    banner "Шаг 9/9 — BBR + fq"
+
+    printf '%sBBR меняет алгоритм контроля перегрузки TCP, fq — дисциплину очереди.%s\n' "$C_DIM" "$C_RESET"
+    printf '%sНа отдачу через VPN влияет заметно, но требует поддержки в ядре.%s\n\n' "$C_DIM" "$C_RESET"
+
+    if ! ask_yn "Включить BBR + fq?" y; then
+        info "Пропускаю."; return 0
+    fi
+
+    if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        warn "BBR недоступен в этом ядре — пропускаю"
+        dim "Ядро: $(uname -r). Нужен модуль tcp_bbr либо ядро 4.9+."
+        return 0
+    fi
+
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    sysctl --system >/dev/null 2>&1
+
+    local cc qd
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    qd=$(sysctl -n net.core.default_qdisc)
+    [[ "$cc" == "bbr" ]] && ok "tcp_congestion_control = bbr" || warn "BBR не применился: $cc"
+    [[ "$qd" == "fq"  ]] && ok "default_qdisc = fq"          || warn "fq не применился: $qd"
+    dim "На уже поднятых интерфейсах fq вступит в силу после перезагрузки."
+    dim "Сейчас: tc qdisc show dev \$(ip route show default | awk '{print \$5; exit}')"
+
+    state_mark "bbr"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Итог
 # ─────────────────────────────────────────────────────────────────────────────
 summary() {
     banner "Готово"
 
     printf '%sЧто сделано:%s\n' "$C_BOLD" "$C_RESET"
-    for k in system ssh tailscale dns remnanode selfsteal warp firewall; do
+    for k in system ssh tailscale dns remnanode selfsteal warp firewall bbr; do
         if state_done "$k"; then
             printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$k"
         else
@@ -1007,7 +1026,7 @@ main() {
 
     preflight
 
-    printf '\n%sБудут выполнены 8 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
+    printf '\n%sБудут выполнены 9 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
     ask_yn "Начинаем?" y || { info "Отменено."; exit 0; }
 
     step_system
@@ -1018,6 +1037,7 @@ main() {
     step_selfsteal
     step_warp
     step_firewall
+    step_bbr
     summary
 }
 

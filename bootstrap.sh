@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.1.1"
+readonly BOOTSTRAP_VERSION="1.1.2"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -472,6 +472,17 @@ step_tailscale() {
 # Шаг 4. Домен
 # ─────────────────────────────────────────────────────────────────────────────
 step_dns() {
+    # Домен, сохранённый прошлым запуском: подставим его умолчанием,
+    # чтобы при повторном проходе не набирать заново.
+    local saved=""
+    [[ -f "$STATE_DIR/domain" ]] && saved=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+    DOMAIN="${DOMAIN:-$saved}"
+
+    if ! should_run "dns" "A-запись домена"; then
+        [[ -n "$DOMAIN" ]] && info "Домен из прошлого запуска: $DOMAIN"
+        return 0
+    fi
+
     banner "Шаг 4/9 — A-запись домена"
 
     printf '%sSelfsteal выпускает сертификат Let'"'"'s Encrypt через TLS-ALPN на 443.%s\n' "$C_DIM" "$C_RESET"
@@ -488,9 +499,24 @@ step_dns() {
 
     while true; do
         ask_var DOMAIN "Полный домен для selfsteal (например seafile.example.com):" "${DOMAIN:-}"
+
+        if [[ -z "$DOMAIN" ]]; then
+            warn "Домен не введён."
+            ask_yn "  Пропустить шаг целиком?" y && { info "Пропускаю."; return 0; }
+            continue
+        fi
+
         if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
             err "Домен выглядит некорректно."
+            ask_yn "  Ввести заново?" y || { info "Пропускаю шаг."; return 0; }
             continue
+        fi
+
+        # Проверку можно не делать: DNS ещё не распространился, домен за
+        # сплит-хорайзоном, или пользователь просто знает, что запись верна.
+        if ! ask_yn "  Проверить A-запись через DNS?" y; then
+            warn "Проверка пропущена — если запись неверна, сертификат не выпустится."
+            break
         fi
 
         info "Проверяю A-запись $DOMAIN..."
@@ -753,6 +779,17 @@ node_port() {
     printf '%s' "$p"
 }
 
+# Есть ли правило, разрешающее указанный TCP-порт.
+# У выключенного ufw `status` печатает только "Status: inactive" и правил
+# не показывает вообще — добавленные, но не применённые лежат в `show added`.
+# Поэтому смотрим оба места: до включения работает первое, после — второе.
+ssh_rule_present() {
+    local port="$1"
+    ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+(in[[:space:]]+)?${port}/tcp" && return 0
+    ufw status    2>/dev/null | grep -qE "^${port}/tcp" && return 0
+    return 1
+}
+
 # Контейнеры с опубликованными наружу портами. Docker пишет свои правила
 # в цепочку DOCKER-USER, минуя ufw, поэтому такие порты остаются открытыми
 # даже при deny incoming — про них надо предупредить отдельно.
@@ -874,17 +911,28 @@ step_firewall() {
         fi
     fi
 
-    # Проверяем, что правило для SSH действительно в списке. Без него
-    # включение ufw обрывает текущую сессию и запирает нас снаружи.
+    # Проверяем, что правило для SSH действительно есть. Без него включение
+    # ufw обрывает текущую сессию и запирает нас снаружи.
     local first_ssh; first_ssh=${sshp%% *}
-    if ! ufw status | grep -qE "^$first_ssh/tcp"; then
-        err "Правило для SSH не появилось в списке — НЕ включаю ufw"
-        ufw status | sed 's/^/    /'
+    if ! ssh_rule_present "$first_ssh"; then
+        err "Правило для SSH не найдено — НЕ включаю ufw"
+        ufw show added 2>/dev/null | sed 's/^/    /'
         return 1
     fi
+    ok "Правило для SSH на месте"
 
     ufw --force enable >/dev/null || { err "ufw enable вернул ошибку"; return 1; }
     ok "ufw включён"
+
+    # После включения правило обязано быть видно уже в status. Если его нет —
+    # выключаем немедленно, пока текущая сессия жива: established-соединения
+    # ufw пропускает, но новый вход был бы невозможен.
+    if ! ufw status | grep -qE "^$first_ssh/tcp"; then
+        err "После включения правило для SSH не видно в ufw status — выключаю ufw обратно"
+        ufw disable >/dev/null 2>&1 || true
+        ufw status | sed 's/^/    /'
+        return 1
+    fi
 
     # ── Проверка результата ───────────────────────────────────────────────
     printf '\n'
@@ -1033,7 +1081,9 @@ main() {
     step_remnanode
     step_selfsteal
     step_warp
-    step_firewall
+    # Шаг может вернуть ненулевой код (например, отказался включать ufw).
+    # Без || это под set -e обрывает весь скрипт вместе с оставшимися шагами.
+    step_firewall || warn "Шаг файрвола не завершён — подробности выше"
     step_bbr
     summary
 }

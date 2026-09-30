@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.1.3"
+readonly BOOTSTRAP_VERSION="1.1.4"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -679,23 +679,42 @@ step_selfsteal() {
     run_remote "$R_SELFSTEAL" "@" "--nginx" "install" || warn "selfsteal.sh вернул ненулевой код"
 
     printf '\n'
-    local ssl_found=false
-    for d in /opt/selfsteal/ssl /etc/nginx/ssl /opt/selfsteal; do
-        if [[ -f "$d/fullchain.crt" ]]; then
-            ok "Сертификат найден: $d/fullchain.crt"
-            openssl x509 -in "$d/fullchain.crt" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
-            ssl_found=true; break
-        fi
+    local app_dir=""
+    app_dir=$(selfsteal_dir) || true
+    if [[ -n "$app_dir" ]]; then
+        ok "Каталог selfsteal: $app_dir"
+    else
+        warn "Каталог установки selfsteal не найден — проверки ниже могут не сработать"
+    fi
+
+    local ssl_found=false c
+    for c in ${app_dir:+"$app_dir/ssl/fullchain.crt"} \
+             /opt/nginx-selfsteal/ssl/fullchain.crt \
+             /opt/caddy/ssl/fullchain.crt \
+             /opt/selfsteal/ssl/fullchain.crt \
+             /etc/nginx/ssl/fullchain.crt; do
+        [[ -f "$c" ]] || continue
+        ok "Сертификат найден: $c"
+        openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
+        ssl_found=true; break
     done
-    $ssl_found || warn "Файлы сертификата не найдены в типичных путях — проверьте вывод скрипта выше"
+    $ssl_found || warn "Файлы сертификата не найдены — проверьте вывод скрипта выше"
 
     [[ -S /dev/shm/nginx.sock ]] && ok "Unix-сокет /dev/shm/nginx.sock создан" \
         || warn "Сокет /dev/shm/nginx.sock отсутствует — REALITY target не заработает"
 
-    if grep -rq "proxy_protocol" /etc/nginx/ 2>/dev/null; then
-        ok "В nginx включён proxy_protocol (нужен при xver: 1)"
+    # Ищем по каталогу на ХОСТЕ: nginx работает в контейнере, где конфиг лежит
+    # по /etc/nginx/nginx.conf, но это путь внутри контейнера. На хосте файл
+    # живёт в $app_dir и монтируется томом.
+    local pp_dirs=() d
+    for d in ${app_dir:+"$app_dir"} /opt/nginx-selfsteal /opt/caddy /etc/nginx; do
+        [[ -d "$d" ]] && pp_dirs+=("$d")
+    done
+    if ((${#pp_dirs[@]})) && grep -rq "proxy_protocol" "${pp_dirs[@]}" 2>/dev/null; then
+        ok "proxy_protocol включён (нужен при xver: 1)"
     else
-        warn "proxy_protocol в конфигах nginx не найден — при xver: 1 соединения будут рваться"
+        warn "proxy_protocol в конфигах не найден — при xver: 1 соединения будут рваться"
+        dim "Искали в: ${pp_dirs[*]:-(каталогов не найдено)}"
     fi
 
     state_mark "selfsteal"
@@ -787,6 +806,17 @@ ssh_rule_present() {
     local port="$1"
     ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+(in[[:space:]]+)?${port}/tcp" && return 0
     ufw status    2>/dev/null | grep -qE "^${port}/tcp" && return 0
+    return 1
+}
+
+# Каталог selfsteal на хосте. selfsteal.sh ставит nginx контейнером и кладёт
+# конфиг, сертификаты и html в /opt/nginx-selfsteal (вариант с Caddy — в
+# /opt/caddy). Путь /etc/nginx существует только ВНУТРИ контейнера.
+selfsteal_dir() {
+    local d
+    for d in /opt/nginx-selfsteal /opt/caddy /opt/selfsteal; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
     return 1
 }
 

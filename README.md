@@ -132,12 +132,7 @@ Preflight отрабатывает до вопросов и прерывает �
 - `/opt/remnanode/docker-compose.yml` — образ `ghcr.io/remnawave/node`, `network_mode: host`, `cap_add: NET_ADMIN`, лимит дескрипторов.
 - `/usr/local/bin/rn` — обёртка над `docker compose` вместо CLI, который ставил внешний скрипт: `rn ps`, `rn logs -f`, `rn restart`, `rn down`.
 
-Два тома, которых нет в установке по умолчанию:
-
-| Том | Зачем |
-|---|---|
-| `/dev/shm:/dev/shm` | unix-сокет selfsteal: REALITY отдаёт туда чужой трафик, а сокет создаёт соседний контейнер |
-| `/opt/remnanode/cert:/var/lib/remnawave/configs/xray/ssl:ro` | сертификат для инбаунда Hysteria2 на UDP 443 — Xray читает его изнутри контейнера |
+Плюс том, которого нет в установке по умолчанию: `/dev/shm:/dev/shm`. Через него нода видит unix-сокет, который создаёт соседний контейнер с nginx, — туда REALITY отдаёт чужой трафик. У внешнего установщика эта строка лежала закомментированной.
 
 ### Версия образа и совместимость с панелью
 

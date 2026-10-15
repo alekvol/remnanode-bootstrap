@@ -29,9 +29,6 @@ readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
 readonly BACKUP_DIR="/root/remnanode-bootstrap-backups"
 
 readonly NODE_DIR="/opt/remnanode"
-# Путь ВНУТРИ контейнера ноды: именно его указывают в tlsSettings.certificates
-# инбаунда Hysteria2 в конфиге Xray, который пушит панель.
-readonly NODE_CERT_IN_CONTAINER="/var/lib/remnawave/configs/xray/ssl"
 
 # remnanode.sh больше не используется: ноду ставим своим compose (шаг 5).
 readonly R_SELFSTEAL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
@@ -593,8 +590,8 @@ step_remnanode() {
     banner "Шаг 5/9 — Установка Remnanode"
 
     printf '%sСтавим ноду своим docker-compose, без внешнего установщика.%s\n' "$C_DIM" "$C_RESET"
-    printf '%sК штатному набору добавлены два тома: /dev/shm для unix-сокета%s\n' "$C_DIM" "$C_RESET"
-    printf '%sselfsteal и каталог с сертификатом — он нужен инбаунду Hysteria2.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '%sК штатному набору добавлен том /dev/shm — через него нода видит%s\n' "$C_DIM" "$C_RESET"
+    printf '%sunix-сокет, который создаёт соседний контейнер с nginx.%s\n\n' "$C_DIM" "$C_RESET"
 
     if ! ask_yn "Устанавливать ноду сейчас?" y; then
         info "Пропускаю."; return 0
@@ -602,7 +599,7 @@ step_remnanode() {
 
     install_docker || return 1
 
-    mkdir -p "$NODE_DIR/cert"
+    mkdir -p "$NODE_DIR"
     chmod 700 "$NODE_DIR"
 
     # ── SECRET_KEY и порт ─────────────────────────────────────────────────
@@ -673,10 +670,9 @@ services:
         soft: 1048576
         hard: 1048576
     volumes:
-      # unix-сокет selfsteal: REALITY отдаёт сюда чужой трафик
+      # unix-сокет selfsteal: REALITY отдаёт сюда чужой трафик,
+      # а создаёт сокет соседний контейнер с nginx
       - /dev/shm:/dev/shm
-      # сертификат для инбаунда Hysteria2 (UDP 443)
-      - $NODE_DIR/cert:$NODE_CERT_IN_CONTAINER:ro
     logging:
       driver: json-file
       options:

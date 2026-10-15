@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.3.0"
+readonly BOOTSTRAP_VERSION="1.4.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -37,7 +37,9 @@ readonly SS_CONTAINER="selfsteal-nginx"
 readonly SS_SOCKET="/dev/shm/nginx.sock"
 readonly SS_NGINX_TAG="1.29-alpine"
 
-readonly R_WTM="https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh"
+# wtm.sh больше не используется: WARP поднимаем через wgcf сами (шаг 7).
+readonly WARP_CONFIG="/etc/wireguard/warp.conf"
+readonly WARP_ACCOUNT="/etc/wireguard/wgcf-account.toml"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Вывод
@@ -169,21 +171,6 @@ public_ip() {
 port_busy() {
     ss -tlnH "sport = :$1" 2>/dev/null | grep -q . && return 0
     return 1
-}
-
-# Запуск внешнего скрипта. Пайп не используем: скриптам нужен stdin для диалога.
-run_remote() {
-    local url="$1"; shift
-    local tmp; tmp=$(mktemp /tmp/rb-XXXXXX.sh)
-    info "Скачиваю $url"
-    curl -fsSL --max-time 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "Не удалось скачать $url"; }
-    local lines; lines=$(wc -l < "$tmp")
-    dim "Получено строк: $lines"
-    info "Запускаю: bash $tmp $*"
-    bash "$tmp" "$@" </dev/tty
-    local rc=$?
-    rm -f "$tmp"
-    return $rc
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1084,56 +1071,184 @@ step_selfsteal() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Шаг 7. WARP, вариант B
 # ─────────────────────────────────────────────────────────────────────────────
+install_wgcf() {
+    have wgcf && { ok "wgcf уже установлен: $(wgcf --version 2>&1 | head -1)"; return 0; }
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        *) err "Архитектура $(uname -m) не поддерживается wgcf"; return 1 ;;
+    esac
+
+    local ver
+    ver=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+          | grep -o '"tag_name": *"[^"]*' | cut -d'"' -f4) || true
+    [[ -n "$ver" ]] || { err "Не удалось узнать версию wgcf (GitHub API недоступен?)"; return 1; }
+
+    local tmp
+    tmp=$(mktemp -d)
+    info "Скачиваю wgcf $ver ($arch)..."
+    if ! curl -fsSL "https://github.com/ViRb3/wgcf/releases/download/$ver/wgcf_${ver#v}_linux_$arch" \
+         -o "$tmp/wgcf"; then
+        rm -rf "$tmp"; err "Не удалось скачать wgcf"; return 1
+    fi
+    # Пустой или чужой архитектуры файл установится молча и сломается позже,
+    # уже на регистрации, где причина будет неочевидна.
+    [[ -s "$tmp/wgcf" ]] || { rm -rf "$tmp"; err "Скачанный wgcf пуст"; return 1; }
+    chmod +x "$tmp/wgcf"
+    if ! "$tmp/wgcf" --version >/dev/null 2>&1; then
+        rm -rf "$tmp"; err "Скачанный wgcf не запускается на этой системе"; return 1
+    fi
+    install -m 755 "$tmp/wgcf" /usr/local/bin/wgcf
+    rm -rf "$tmp"
+    ok "wgcf $ver установлен"
+}
+
+# Приводит профиль от wgcf к виду, пригодному для wg-quick в варианте B.
+adapt_warp_profile() {
+    local f="$1"
+
+    # DNS от Cloudflare нам не нужен: wg-quick прописал бы его системе целиком.
+    sed -i '/^DNS =/d' "$f"
+
+    # Главное в варианте B. Без Table = off wg-quick добавит маршрут по
+    # умолчанию через WARP, и ВЕСЬ трафик сервера уйдёт в Cloudflare —
+    # включая SSH-ответы и связь с панелью. С ним интерфейс просто
+    # поднимается, а в туннель попадают только сокеты, привязанные к нему
+    # через sockopt.interface.
+    grep -q '^Table = off' "$f" || sed -i '/^MTU =/a Table = off' "$f"
+
+    grep -q '^PersistentKeepalive' "$f" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$f"
+
+    # wgcf пишет IPv4 и IPv6 одной строкой Address. Если IPv6 на хосте
+    # выключен, вырезаем только IPv6-токен, не трогая строку целиком.
+    if [[ ! -f /proc/net/if_inet6 ]]; then
+        warn "IPv6 на хосте выключен — убираю IPv6 из профиля"
+        sed -i -E 's#,[[:space:]]*[0-9A-Fa-f:]+/128##g' "$f"
+        sed -i -E '/^AllowedIPs/ s#,[[:space:]]*::/0##' "$f"
+    fi
+}
+
+install_warp_watchdog() {
+    cat > /usr/local/bin/warp-watchdog <<'EOF'
+#!/usr/bin/env bash
+# Поднимает wg-quick@warp, если интерфейс пропал. Вариант B опирается на
+# то, что интерфейс есть: без него sockopt.interface отправит трафик в никуда.
+ip link show warp >/dev/null 2>&1 && exit 0
+logger -t warp-watchdog "интерфейс warp отсутствует, перезапускаю wg-quick@warp"
+systemctl restart wg-quick@warp
+EOF
+    chmod 755 /usr/local/bin/warp-watchdog
+    printf '*/5 * * * * root /usr/local/bin/warp-watchdog\n' > /etc/cron.d/warp-watchdog
+    chmod 644 /etc/cron.d/warp-watchdog
+    ok "Watchdog установлен: проверка каждые 5 минут"
+}
+
 step_warp() {
     should_run "warp" "WARP" || return 0
     banner "Шаг 7/9 — WARP (вариант B, host-интерфейс)"
 
-    printf '%sВариант B привязывает сокеты Xray к kernel-интерфейсу wg-quick@warp%s\n' "$C_DIM" "$C_RESET"
-    printf '%sчерез sockopt.interface. Быстрее варианта A, ключи не попадают в конфиг Xray.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '%sВариант B поднимает kernel-интерфейс wg-quick@warp и привязывает%s\n' "$C_DIM" "$C_RESET"
+    printf '%sк нему сокеты Xray через sockopt.interface. Быстрее варианта A,%s\n' "$C_DIM" "$C_RESET"
+    printf '%sключи WireGuard в конфиг Xray не попадают.%s\n\n' "$C_DIM" "$C_RESET"
 
     if ! ask_yn "Устанавливать WARP?" y; then
         info "Пропускаю."; return 0
     fi
 
-    info "Ставлю CLI wtm..."
-    run_remote "$R_WTM" "@" "install-script" || warn "wtm.sh вернул ненулевой код"
-
-    if have wtm; then
-        ok "CLI wtm установлен"
-        printf '\n%sДалее ставим ТОЛЬКО WARP (без Tor).%s\n' "$C_DIM" "$C_RESET"
-        if ask_yn "Запустить wtm install-warp?" y; then
-            wtm install-warp </dev/tty || warn "install-warp вернул ошибку"
+    if [[ -f "$WARP_CONFIG" ]]; then
+        ok "Конфигурация WARP уже есть: $WARP_CONFIG"
+        if ! ask_yn "  Перерегистрировать аккаунт заново?" n; then
+            systemctl enable --now wg-quick@warp >>"$LOG_FILE" 2>&1 || true
+            verify_warp
+            state_mark "warp"
+            return 0
         fi
-        if ask_yn "Включить watchdog (автоперезапуск wg-quick@warp)?" y; then
-            wtm watchdog-on </dev/tty || warn "watchdog-on вернул ошибку"
-        fi
-    else
-        warn "CLI wtm не найден — установите WARP вручную"
     fi
 
+    info "Ставлю wireguard-tools..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq wireguard-tools >/dev/null \
+        || { err "Не удалось поставить wireguard-tools"; return 1; }
+
+    install_wgcf || return 1
+
+    local tmp
+    tmp=$(mktemp -d)
+    info "Регистрирую аккаунт WARP..."
+    # Современный wgcf требует явного согласия с условиями: старое
+    # `yes | wgcf register` больше не проходит.
+    if ! (cd "$tmp" && wgcf register --accept-tos >>"$LOG_FILE" 2>&1); then
+        rm -rf "$tmp"
+        err "Регистрация в Cloudflare не удалась, смотрите $LOG_FILE"
+        dim "Часть дата-центров заблокирована на стороне Cloudflare."
+        return 1
+    fi
+    ok "Аккаунт зарегистрирован"
+
+    if ! (cd "$tmp" && wgcf generate >>"$LOG_FILE" 2>&1); then
+        rm -rf "$tmp"; err "wgcf generate не отработал"; return 1
+    fi
+    [[ -f "$tmp/wgcf-profile.conf" ]] || { rm -rf "$tmp"; err "Профиль не создан"; return 1; }
+
+    mkdir -p /etc/wireguard
+    adapt_warp_profile "$tmp/wgcf-profile.conf"
+
+    backup_file "$WARP_CONFIG"
+    install -m 600 "$tmp/wgcf-profile.conf" "$WARP_CONFIG"
+    install -m 600 "$tmp/wgcf-account.toml" "$WARP_ACCOUNT" 2>/dev/null || true
+    rm -rf "$tmp"
+    ok "Профиль установлен: $WARP_CONFIG"
+
+    grep -q '^Table = off' "$WARP_CONFIG" \
+        && ok "Table = off — маршрут по умолчанию остаётся прежним" \
+        || err "В профиле нет Table = off: весь трафик сервера уйдёт в WARP"
+
+    info "Поднимаю wg-quick@warp..."
+    if systemctl enable --now wg-quick@warp >>"$LOG_FILE" 2>&1; then
+        ok "Служба запущена"
+    else
+        err "wg-quick@warp не запустился"
+        journalctl -u wg-quick@warp -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
+        return 1
+    fi
+
+    install_warp_watchdog
+    verify_warp
+    state_mark "warp"
+}
+
+verify_warp() {
     printf '\n'
-    info "Проверяю интерфейс..."
     if ip -br a show warp >/dev/null 2>&1; then
         ok "Интерфейс warp поднят:"
         ip -br a show warp | sed 's/^/    /'
-        local trace
-        trace=$(curl --interface warp -sS --max-time 12 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^warp=' || true)
-        if [[ "$trace" == "warp=on" ]]; then
-            ok "Трафик через интерфейс warp реально идёт в Cloudflare (warp=on)"
-        else
-            warn "Проверка через интерфейс вернула: '${trace:-пусто}'"
-            dim "Диагностика: systemctl status wg-quick@warp"
-        fi
     else
         err "Интерфейс warp не найден — вариант B работать не будет"
         dim "Диагностика: journalctl -u wg-quick@warp -n 30"
+        return 0
     fi
 
-    [[ -f /etc/wireguard/warp-sockopt-outbound.json ]] \
-        && ok "Готовый outbound: /etc/wireguard/warp-sockopt-outbound.json" \
-        || dim "Файл outbound не найден — используйте блок из итоговой инструкции"
+    # Маршрут по умолчанию обязан остаться на физическом интерфейсе.
+    local defdev
+    defdev=$(ip route show default | awk '{print $5; exit}')
+    if [[ "$defdev" == "warp" ]]; then
+        err "Маршрут по умолчанию ушёл в warp — так не должно быть в варианте B"
+        dim "Проверьте Table = off в $WARP_CONFIG"
+    else
+        ok "Маршрут по умолчанию по-прежнему через ${defdev:-?}"
+    fi
 
-    state_mark "warp"
+    local trace
+    trace=$(curl --interface warp -sS --max-time 12 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^warp=' || true)
+    if [[ "$trace" == "warp=on" ]]; then
+        ok "Трафик через интерфейс warp реально идёт в Cloudflare (warp=on)"
+    else
+        warn "Проверка через интерфейс вернула: '${trace:-пусто}'"
+        dim "Диагностика: systemctl status wg-quick@warp"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1461,7 +1576,7 @@ JSON
     dim "rn ps                       — состояние ноды"
     dim "rn logs -f                  — логи контейнера"
     dim "rn restart                  — перезапуск ноды"
-    dim "wtm status                  — состояние WARP"
+    dim "warp-watchdog               — поднять warp, если упал"
     dim "systemctl status wg-quick@warp"
     dim "sshd -T | grep -i password  — проверить, что пароль отключён"
     dim "curl --interface warp https://www.cloudflare.com/cdn-cgi/trace"

@@ -22,24 +22,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/
 
 Требования: root, Debian или Ubuntu, bash 4+. Всё остальное скрипт доставит сам.
 
-### Если хотите прочитать скрипт перед запуском
-
-Разумная привычка, раз уж он ставит систему от root:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh -o bootstrap.sh
-```
-
-```bash
-less bootstrap.sh && bash bootstrap.sh
-```
-
-### Почему `bash <(...)`, а не `curl | bash`
-
-Через пайп запускать не стоит: bash в этом случае читает текст самого скрипта со stdin, и любой `read` рискует съесть кусок кода вместо ответа. Подстановка процесса передаёт скрипт файловым дескриптором и stdin не занимает.
-
-Запускать лучше под `tmux` или `screen`: шаг 2 перезагружает sshd, и обрыв сессии посреди установки лучше пережить.
-
 ## Что проверяется до первого шага
 
 Preflight отрабатывает до вопросов и прерывает установку, если продолжать бессмысленно:

@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.2.0"
+readonly BOOTSTRAP_VERSION="1.3.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -30,8 +30,13 @@ readonly BACKUP_DIR="/root/remnanode-bootstrap-backups"
 
 readonly NODE_DIR="/opt/remnanode"
 
-# remnanode.sh больше не используется: ноду ставим своим compose (шаг 5).
-readonly R_SELFSTEAL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
+# remnanode.sh и selfsteal.sh больше не используются: ноду и nginx
+# поднимаем своим docker compose (шаги 5 и 6).
+readonly SS_DIR="/opt/selfsteal"
+readonly SS_CONTAINER="selfsteal-nginx"
+readonly SS_SOCKET="/dev/shm/nginx.sock"
+readonly SS_NGINX_TAG="1.29-alpine"
+
 readonly R_WTM="https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -775,80 +780,303 @@ prepare_acme() {
     return 0
 }
 
+# Выпуск и установка сертификата. HTTP-01 через webroot, а не TLS-ALPN:
+# 443 занят Xray под REALITY, и продление по ALPN туда просто не забиндится.
+# Webroot обслуживает наш же nginx на 80, поэтому продление не требует
+# останова чего-либо и работает само из крона acme.sh.
+issue_cert() {
+    local domain="$1" acme="$HOME/.acme.sh/acme.sh"
+    [[ -x "$acme" ]] || { err "acme.sh не найден"; return 1; }
+
+    mkdir -p "$SS_DIR/ssl" "$SS_DIR/acme/.well-known/acme-challenge"
+
+    # Действующий сертификат от прежней установки лучше переиспользовать:
+    # у Let's Encrypt лимит 5 одинаковых сертификатов в неделю.
+    local old
+    for old in /opt/nginx-selfsteal/ssl /opt/caddy/ssl; do
+        [[ -f "$old/fullchain.crt" && -f "$old/private.key" ]] || continue
+        openssl x509 -in "$old/fullchain.crt" -noout -checkend 604800 >/dev/null 2>&1 || continue
+        openssl x509 -in "$old/fullchain.crt" -noout -subject 2>/dev/null | grep -q "$domain" || continue
+        info "Беру действующий сертификат из $old"
+        cp -a "$old/fullchain.crt" "$SS_DIR/ssl/fullchain.crt"
+        cp -a "$old/private.key"   "$SS_DIR/ssl/private.key"
+        ok "Сертификат переиспользован, выпуск не нужен"
+        return 0
+    done
+
+    info "Выпускаю сертификат через HTTP-01 (webroot на порту 80)..."
+    "$acme" --issue -d "$domain" --webroot "$SS_DIR/acme" \
+        --server letsencrypt >>"$LOG_FILE" 2>&1 \
+        || { err "Выпуск не удался, хвост лога:"; tail -15 "$LOG_FILE" | sed 's/^/    /'; return 1; }
+
+    # --reloadcmd выполняется и при каждом автопродлении из крона acme.sh.
+    "$acme" --install-cert -d "$domain" \
+        --key-file       "$SS_DIR/ssl/private.key" \
+        --fullchain-file "$SS_DIR/ssl/fullchain.crt" \
+        --reloadcmd      "docker restart $SS_CONTAINER >/dev/null 2>&1 || true" \
+        >>"$LOG_FILE" 2>&1 \
+        || { err "install-cert не удался, смотрите $LOG_FILE"; return 1; }
+
+    ok "Сертификат выпущен и установлен"
+}
+
+# Конфиг только с портом 80: нужен, пока сертификата нет и основной
+# server-блок стартовать не может.
+write_acme_only_conf() {
+    local domain="$1"
+    cat > "$SS_DIR/conf.d/acme-only.conf" <<EOF
+server {
+    listen 80 default_server;
+    server_name $domain;
+    location /.well-known/acme-challenge/ { root /var/www/acme; }
+    location / { return 404; }
+}
+EOF
+}
+
+write_nginx_files() {
+    local domain="$1"
+    mkdir -p "$SS_DIR/conf.d" "$SS_DIR/html" "$SS_DIR/logs" "$SS_DIR/ssl" \
+             "$SS_DIR/acme/.well-known/acme-challenge"
+
+    cat > "$SS_DIR/nginx.conf" <<'EOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log crit;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    access_log    off;
+    server_tokens off;
+
+    sendfile      on;
+    tcp_nopush    on;
+    keepalive_timeout 65;
+    gzip          on;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+    cat > "$SS_DIR/conf.d/selfsteal.conf" <<EOF
+# Порт 80: ACME-челлендж и редирект. Нужен для выпуска и продления
+# сертификата по HTTP-01 — 443 занят Xray, туда acme.sh не попадёт.
+server {
+    listen 80 default_server;
+    server_name $domain;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+# Unix-сокет: сюда REALITY отдаёт трафик, который не принадлежит нашим
+# клиентам. TLS терминирует nginx, поэтому ssl здесь обязателен, а
+# proxy_protocol — потому что Xray шлёт его при xver: 1.
+server {
+    listen unix:$SS_SOCKET ssl proxy_protocol;
+    http2 on;
+    server_name $domain;
+
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
+
+    ssl_certificate     /etc/nginx/ssl/fullchain.crt;
+    ssl_certificate_key /etc/nginx/ssl/private.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root  /var/www/html;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+    # Страница-заглушка. Её видит тот, кто пришёл на домен без ключа REALITY,
+    # поэтому выглядеть она должна как обычный скучный сайт.
+    if [[ ! -s "$SS_DIR/html/index.html" ]]; then
+        cat > "$SS_DIR/html/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$domain</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#2b3440;background:#f6f7f9}
+main{max-width:34rem;padding:2rem;text-align:center}
+h1{font-size:1.5rem;font-weight:600;margin:0 0 .75rem}
+p{margin:0;color:#6b7684}
+</style>
+</head>
+<body>
+<main>
+<h1>Service is being set up</h1>
+<p>This site is not configured yet. Please check back later.</p>
+</main>
+</body>
+</html>
+EOF
+    fi
+
+    cat > "$SS_DIR/docker-compose.yml" <<EOF
+services:
+  nginx:
+    image: nginx:$SS_NGINX_TAG
+    container_name: $SS_CONTAINER
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./html:/var/www/html:ro
+      - ./acme:/var/www/acme:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./logs:/var/log/nginx
+      # сокет создаётся здесь, а читает его контейнер ноды
+      - /dev/shm:/dev/shm
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+    ok "Конфигурация записана в $SS_DIR"
+}
+
+ss_compose() {
+    docker compose -f "$SS_DIR/docker-compose.yml" --project-directory "$SS_DIR" "$@"
+}
+
 step_selfsteal() {
     should_run "selfsteal" "Selfsteal" || return 0
     banner "Шаг 6/9 — Selfsteal (nginx + unix socket)"
 
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
-    [[ -n "$DOMAIN" ]] || die "Домен не задан — сначала пройдите шаг 4"
+    [[ -n "$DOMAIN" ]] || { err "Домен не задан — сначала пройдите шаг 4"; return 1; }
     info "Домен: $DOMAIN"
 
-    # Повторная проверка: DNS мог не успеть распространиться на шаге 4
-    local resolved
-    resolved=$(dig +short A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | tail -1 || true)
-    if [[ "$resolved" == "$SERVER_IP" ]]; then
-        ok "A-запись по-прежнему корректна ($resolved)"
-    else
-        err "A-запись сейчас: '${resolved:-нет}', ожидался $SERVER_IP"
-        ask_yn "  Продолжить? Сертификат скорее всего не выпустится." n || return 0
-    fi
+    printf '%snginx поднимается контейнером и слушает unix-сокет. TLS терминирует%s\n' "$C_DIM" "$C_RESET"
+    printf '%sон же: REALITY отдаёт ему чужой трафик как есть, при xver: 1.%s\n\n' "$C_DIM" "$C_RESET"
 
-    for p in 80 443; do
-        if port_busy "$p"; then
-            warn "Порт $p занят:"
-            ss -tlnp "sport = :$p" 2>/dev/null | sed 's/^/    /'
-            dim "Let's Encrypt должен достучаться до 443 этого сервера."
-            ask_yn "  Продолжить?" n || return 0
-        fi
-    done
-
-    prepare_acme || { warn "acme.sh не готов — selfsteal пропущен"; return 0; }
-
-    printf '\n'
-    if ! ask_yn "Запустить установку selfsteal?" y; then
+    if ! ask_yn "Настроить selfsteal?" y; then
         info "Пропускаю."; return 0
     fi
 
-    run_remote "$R_SELFSTEAL" "@" "--nginx" "install" || warn "selfsteal.sh вернул ненулевой код"
+    have docker || { err "Нужен Docker — пройдите шаг 5"; return 1; }
 
+    # Повторная проверка: DNS мог не успеть распространиться на шаге 4.
+    local resolved
+    resolved=$(dig +short A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | tail -1 || true)
+    if [[ "$resolved" == "$SERVER_IP" ]]; then
+        ok "A-запись корректна ($resolved)"
+    else
+        err "A-запись сейчас: '${resolved:-нет}', ожидался $SERVER_IP"
+        dim "Без неё Let's Encrypt не подтвердит домен."
+        ask_yn "  Продолжить?" n || return 0
+    fi
+
+    # Установка от внешнего скрипта держит и порт 80, и тот же сокет.
+    local old_dir
+    for old_dir in /opt/nginx-selfsteal /opt/caddy; do
+        [[ -f "$old_dir/docker-compose.yml" ]] || continue
+        warn "Найдена прежняя установка: $old_dir"
+        dim "Она занимает порт 80 и тот же сокет — вместе они не уживутся."
+        if ask_yn "  Остановить её?" y; then
+            docker compose -f "$old_dir/docker-compose.yml" --project-directory "$old_dir" down \
+                >>"$LOG_FILE" 2>&1 || true
+            ok "Прежний контейнер остановлен, файлы в $old_dir не тронуты"
+        else
+            err "Продолжать без остановки нельзя"
+            return 1
+        fi
+    done
+
+    if port_busy 80; then
+        warn "Порт 80 занят — ACME-челлендж не пройдёт:"
+        ss -tlnp "sport = :80" 2>/dev/null | sed 's/^/    /'
+        ask_yn "  Продолжить?" n || return 0
+    fi
+
+    prepare_acme || { err "acme.sh не готов"; return 1; }
+
+    write_nginx_files "$DOMAIN"
+
+    # Пока сертификата нет, основной server-блок не стартует: nginx падает
+    # на отсутствующем ssl_certificate. Поэтому сперва поднимаем только
+    # слушатель на 80, выпускаем сертификат, потом включаем всё.
+    if [[ ! -f "$SS_DIR/ssl/fullchain.crt" ]]; then
+        info "Сертификата нет — временно поднимаю только слушатель на 80"
+        mv "$SS_DIR/conf.d/selfsteal.conf" "$SS_DIR/conf.d/selfsteal.conf.pending"
+        write_acme_only_conf "$DOMAIN"
+        ss_compose up -d >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся"; return 1; }
+        sleep 2
+
+        if ! issue_cert "$DOMAIN"; then
+            mv "$SS_DIR/conf.d/selfsteal.conf.pending" "$SS_DIR/conf.d/selfsteal.conf"
+            rm -f "$SS_DIR/conf.d/acme-only.conf"
+            err "Сертификат не выпущен"
+            return 1
+        fi
+
+        rm -f "$SS_DIR/conf.d/acme-only.conf"
+        mv "$SS_DIR/conf.d/selfsteal.conf.pending" "$SS_DIR/conf.d/selfsteal.conf"
+    else
+        ok "Сертификат уже на месте: $SS_DIR/ssl/fullchain.crt"
+    fi
+
+    info "Поднимаю nginx..."
+    ss_compose up -d --force-recreate >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся"; return 1; }
+    sleep 2
+
+    # ── Проверки ──────────────────────────────────────────────────────────
     printf '\n'
-    local app_dir=""
-    app_dir=$(selfsteal_dir) || true
-    if [[ -n "$app_dir" ]]; then
-        ok "Каталог selfsteal: $app_dir"
+    if docker ps --filter "name=$SS_CONTAINER" --filter status=running --format '{{.Names}}' \
+        | grep -qx "$SS_CONTAINER"; then
+        ok "Контейнер $SS_CONTAINER работает"
     else
-        warn "Каталог установки selfsteal не найден — проверки ниже могут не сработать"
+        err "Контейнер не поднялся"
+        ss_compose logs --tail 30 2>&1 | sed 's/^/    /' || true
+        return 1
     fi
 
-    local ssl_found=false c
-    for c in ${app_dir:+"$app_dir/ssl/fullchain.crt"} \
-             /opt/nginx-selfsteal/ssl/fullchain.crt \
-             /opt/caddy/ssl/fullchain.crt \
-             /opt/selfsteal/ssl/fullchain.crt \
-             /etc/nginx/ssl/fullchain.crt; do
-        [[ -f "$c" ]] || continue
-        ok "Сертификат найден: $c"
-        openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
-        ssl_found=true; break
-    done
-    $ssl_found || warn "Файлы сертификата не найдены — проверьте вывод скрипта выше"
-
-    [[ -S /dev/shm/nginx.sock ]] && ok "Unix-сокет /dev/shm/nginx.sock создан" \
-        || warn "Сокет /dev/shm/nginx.sock отсутствует — REALITY target не заработает"
-
-    # Ищем по каталогу на ХОСТЕ: nginx работает в контейнере, где конфиг лежит
-    # по /etc/nginx/nginx.conf, но это путь внутри контейнера. На хосте файл
-    # живёт в $app_dir и монтируется томом.
-    local pp_dirs=() d
-    for d in ${app_dir:+"$app_dir"} /opt/nginx-selfsteal /opt/caddy /etc/nginx; do
-        [[ -d "$d" ]] && pp_dirs+=("$d")
-    done
-    if ((${#pp_dirs[@]})) && grep -rq "proxy_protocol" "${pp_dirs[@]}" 2>/dev/null; then
-        ok "proxy_protocol включён (нужен при xver: 1)"
+    if [[ -f "$SS_DIR/ssl/fullchain.crt" ]]; then
+        ok "Сертификат: $SS_DIR/ssl/fullchain.crt"
+        openssl x509 -in "$SS_DIR/ssl/fullchain.crt" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
     else
-        warn "proxy_protocol в конфигах не найден — при xver: 1 соединения будут рваться"
-        dim "Искали в: ${pp_dirs[*]:-(каталогов не найдено)}"
+        err "Файл сертификата отсутствует"
     fi
+
+    [[ -S "$SS_SOCKET" ]] && ok "Unix-сокет $SS_SOCKET создан" \
+        || err "Сокет $SS_SOCKET отсутствует — REALITY target не заработает"
+
+    grep -q 'proxy_protocol' "$SS_DIR/conf.d/selfsteal.conf" 2>/dev/null \
+        && ok "proxy_protocol включён (нужен при xver: 1)" \
+        || err "proxy_protocol не найден в конфиге"
+
+    printf '\n%sВ панели у инбаунда REALITY должно стоять:%s\n' "$C_BOLD" "$C_RESET"
+    dim "serverNames: [\"$DOMAIN\"]"
+    dim "target:      \"$SS_SOCKET\""
+    dim "xver:        1"
 
     state_mark "selfsteal"
 }
@@ -939,17 +1167,6 @@ ssh_rule_present() {
     local port="$1"
     ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+(in[[:space:]]+)?${port}/tcp" && return 0
     ufw status    2>/dev/null | grep -qE "^${port}/tcp" && return 0
-    return 1
-}
-
-# Каталог selfsteal на хосте. selfsteal.sh ставит nginx контейнером и кладёт
-# конфиг, сертификаты и html в /opt/nginx-selfsteal (вариант с Caddy — в
-# /opt/caddy). Путь /etc/nginx существует только ВНУТРИ контейнера.
-selfsteal_dir() {
-    local d
-    for d in /opt/nginx-selfsteal /opt/caddy /opt/selfsteal; do
-        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
-    done
     return 1
 }
 

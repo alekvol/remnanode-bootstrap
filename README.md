@@ -68,6 +68,7 @@ Preflight отрабатывает до вопросов и прерывает �
 | 7 | Свой WARP: wgcf, `wg-quick@warp` с `Table = off`, watchdog |
 | 8 | ufw: наружу только 22, 80 и 443, порт ноды — только из тейлнета |
 | 9 | BBR + fq |
+| 10 | Инбаунд VLESS XHTTP поверх REALITY: генерация JSON для панели |
 
 Каждый шаг можно пропустить. Пройденные шаги записываются в `/var/lib/remnanode-bootstrap/state`, поэтому скрипт безопасно перезапускать — он предложит пропустить сделанное.
 
@@ -174,6 +175,35 @@ listen unix:/dev/shm/nginx.sock ssl proxy_protocol;   # сюда REALITY отд�
 Страница-заглушка не перезаписывается при повторном запуске — свою можно положить в `html/` и не бояться потерять.
 
 Прежняя установка от внешнего скрипта (`/opt/nginx-selfsteal`, `/opt/caddy`) занимает и порт 80, и тот же сокет. Скрипт её находит и предлагает остановить; файлы при этом не трогаются, так что откат — это `docker compose up -d` в старом каталоге.
+
+## XHTTP поверх REALITY
+
+Шаг 10 добавляет второй инбаунд рядом с уже работающим REALITY — конфиг Xray живёт в панели, поэтому скрипт только генерирует JSON, а вставляете его вы.
+
+Схема взята из официального примера [VLESS-XHTTP-REALITY / steal_oneself](https://github.com/chika0801/Xray-examples/blob/main/VLESS-XHTTP-REALITY/steal_oneself/config_server.json):
+
+```
+клиент REALITY + XHTTP ──► 443, инбаунд REALITY
+                             │
+                             ├─ не прошёл проверку REALITY ──► realitySettings.target
+                             │                                 = /dev/shm/nginx.sock (nginx, сайт-заглушка)
+                             │
+                             └─ прошёл, но внутри не VLESS ──► fallback ──► @xhttp (инбаунд XHTTP)
+```
+
+XHTTP слушает **абстрактный unix-сокет** `@xhttp` внутри контейнера: порт не занимается, наружу ничего не выставляется, nginx в цепочке не участвует и его конфигурация не меняется.
+
+### Почему fallback без `path`
+
+Напрашивается разбор по пути — `{"path": "/xhttp", "dest": ...}`. Так делать не надо: разбор по `path` на xhttp работает некорректно, это [известный баг Xray-core #4832](https://github.com/XTLS/Xray-core/issues/4832).
+
+Поэтому fallback один и без условий:
+
+```json
+"fallbacks": [ { "dest": "@xhttp" } ]
+```
+
+Путь проверяет сам XHTTP-инбаунд и отвергает чужие запросы. `realitySettings.target` и `xver: 1` при этом остаются прежними — трафик, не прошедший проверку REALITY, как и раньше уходит в nginx.
 
 ## WARP
 

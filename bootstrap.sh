@@ -12,6 +12,7 @@
 #   7. WARP, вариант B (host-интерфейс)
 #   8. Файрвол (ufw)
 #   9. BBR + fq
+#  10. Инбаунд VLESS XHTTP поверх REALITY
 #
 # Запуск от root, одной командой:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
@@ -22,7 +23,7 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.4.0"
+readonly BOOTSTRAP_VERSION="1.5.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -246,7 +247,7 @@ preflight() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_system() {
     should_run "system" "Подготовка системы" || return 0
-    banner "Шаг 1/9 — Подготовка системы"
+    banner "Шаг 1/10 — Подготовка системы"
 
     info "Обновляю списки пакетов..."
     export DEBIAN_FRONTEND=noninteractive
@@ -286,7 +287,7 @@ sshd_effective() { sshd -T 2>/dev/null | grep -iE "^$1 " | awk '{print $2}'; }
 
 step_ssh() {
     should_run "ssh" "Настройка SSH" || return 0
-    banner "Шаг 2/9 — Вход по SSH-ключу"
+    banner "Шаг 2/10 — Вход по SSH-ключу"
 
     printf '%sВ Termius: Keychain → New Key → Generate, тип ED25519.%s\n' "$C_DIM" "$C_RESET"
     printf '%sЗатем откройте ключ и скопируйте ПУБЛИЧНУЮ часть (ssh-ed25519 AAAA...).%s\n\n' "$C_DIM" "$C_RESET"
@@ -426,7 +427,7 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 step_tailscale() {
     should_run "tailscale" "Tailscale" || return 0
-    banner "Шаг 3/9 — Tailscale"
+    banner "Шаг 3/10 — Tailscale"
 
     if ! ask_yn "Установить Tailscale?" y; then
         info "Пропускаю."; return 0
@@ -483,7 +484,7 @@ step_dns() {
         return 0
     fi
 
-    banner "Шаг 4/9 — A-запись домена"
+    banner "Шаг 4/10 — A-запись домена"
 
     printf '%sSelfsteal выпускает сертификат Let'"'"'s Encrypt через TLS-ALPN на 443.%s\n' "$C_DIM" "$C_RESET"
     printf '%sДля этого домен ОБЯЗАН резолвиться в IP этого сервера.%s\n\n' "$C_DIM" "$C_RESET"
@@ -579,7 +580,7 @@ env_value() {
 
 step_remnanode() {
     should_run "remnanode" "Remnanode" || return 0
-    banner "Шаг 5/9 — Установка Remnanode"
+    banner "Шаг 5/10 — Установка Remnanode"
 
     printf '%sСтавим ноду своим docker-compose, без внешнего установщика.%s\n' "$C_DIM" "$C_RESET"
     printf '%sК штатному набору добавлен том /dev/shm — через него нода видит%s\n' "$C_DIM" "$C_RESET"
@@ -956,7 +957,7 @@ ss_compose() {
 
 step_selfsteal() {
     should_run "selfsteal" "Selfsteal" || return 0
-    banner "Шаг 6/9 — Selfsteal (nginx + unix socket)"
+    banner "Шаг 6/10 — Selfsteal (nginx + unix socket)"
 
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
     [[ -n "$DOMAIN" ]] || { err "Домен не задан — сначала пройдите шаг 4"; return 1; }
@@ -1147,7 +1148,7 @@ EOF
 
 step_warp() {
     should_run "warp" "WARP" || return 0
-    banner "Шаг 7/9 — WARP (вариант B, host-интерфейс)"
+    banner "Шаг 7/10 — WARP (вариант B, host-интерфейс)"
 
     printf '%sВариант B поднимает kernel-интерфейс wg-quick@warp и привязывает%s\n' "$C_DIM" "$C_RESET"
     printf '%sк нему сокеты Xray через sockopt.interface. Быстрее варианта A,%s\n' "$C_DIM" "$C_RESET"
@@ -1296,7 +1297,7 @@ docker_published() {
 
 step_firewall() {
     should_run "firewall" "Файрвол" || return 0
-    banner "Шаг 8/9 — Файрвол (ufw)"
+    banner "Шаг 8/10 — Файрвол (ufw)"
 
     printf '%sНаружу открываются только 22, 80 и 443. Порт ноды доступен%s\n' "$C_DIM" "$C_RESET"
     printf '%sтолько из тейлнета, снаружи закрыт. Всё исходящее разрешено.%s\n\n' "$C_DIM" "$C_RESET"
@@ -1478,7 +1479,7 @@ step_firewall() {
 # ─────────────────────────────────────────────────────────────────────────────
 step_bbr() {
     should_run "bbr" "BBR + fq" || return 0
-    banner "Шаг 9/9 — BBR + fq"
+    banner "Шаг 9/10 — BBR + fq"
 
     printf '%sBBR меняет алгоритм контроля перегрузки TCP, fq — дисциплину очереди.%s\n' "$C_DIM" "$C_RESET"
     printf '%sНа отдачу через VPN влияет заметно, но требует поддержки в ядре.%s\n\n' "$C_DIM" "$C_RESET"
@@ -1539,13 +1540,101 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Шаг 10. Инбаунд XHTTP
+# ─────────────────────────────────────────────────────────────────────────────
+step_xhttp() {
+    should_run "xhttp" "Инбаунд XHTTP" || return 0
+    banner "Шаг 10/10 — Инбаунд VLESS XHTTP поверх REALITY"
+
+    DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
+
+    printf '%sXHTTP добавляется вторым инбаундом рядом с уже работающим REALITY.%s\n' "$C_DIM" "$C_RESET"
+    printf '%sОн слушает абстрактный unix-сокет внутри контейнера, порт не занимает%s\n' "$C_DIM" "$C_RESET"
+    printf '%sи nginx не задействует: трафик приходит к нему через fallback.%s\n\n' "$C_DIM" "$C_RESET"
+
+    if ! ask_yn "Сгенерировать конфигурацию XHTTP?" y; then
+        info "Пропускаю."; return 0
+    fi
+
+    local path tag sock="@xhttp"
+    # Путь не секрет, но угадываемый путь упрощает активное прощупывание.
+    path=$(openssl rand -hex 8 2>/dev/null) || path=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    ask_var path "Путь XHTTP (без ведущего слэша):" "$path"
+    path="${path#/}"
+    ask_var tag "Тег инбаунда:" "VLESS-XHTTP"
+
+    local out="$STATE_DIR/xhttp-inbound.json"
+    cat > "$out" <<EOF
+{
+  "tag": "$tag",
+  "listen": "$sock",
+  "protocol": "vless",
+  "settings": {
+    "decryption": "none",
+    "clients": []
+  },
+  "streamSettings": {
+    "network": "xhttp",
+    "xhttpSettings": {
+      "path": "/$path"
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"]
+  }
+}
+EOF
+    ok "Инбаунд записан: $out"
+
+    hr
+    printf '%s1. Добавьте этот инбаунд в конфиг Xray в панели:%s\n\n' "$C_BOLD" "$C_RESET"
+    sed 's/^/    /' "$out"
+
+    printf '\n%s2. В уже существующем инбаунде REALITY на 443 добавьте fallback:%s\n\n' "$C_BOLD" "$C_RESET"
+    cat <<EOF
+    "settings": {
+      "decryption": "none",
+      "clients": [ ... оставьте как есть ... ],
+      "fallbacks": [
+        { "dest": "$sock" }
+      ]
+    }
+EOF
+    hr
+
+    printf '\n%sПочему fallback без "path"%s\n' "$C_BOLD" "$C_RESET"
+    dim "Разбор по path на xhttp работает некорректно (Xray-core #4832)."
+    dim "Поэтому fallback один и без условий: XHTTP-инбаунд сам сверяет путь"
+    dim "и отвергает чужие запросы. Это схема из официального примера"
+    dim "VLESS-XHTTP-REALITY/steal_oneself."
+
+    printf '\n%sЧто остаётся без изменений%s\n' "$C_BOLD" "$C_RESET"
+    dim "realitySettings.target — по-прежнему $SS_SOCKET, xver: 1."
+    dim "Непрошедший проверку REALITY трафик как и раньше уходит в nginx."
+    dim "Конфигурация nginx не меняется, порт не добавляется."
+
+    if [[ -n "$DOMAIN" ]]; then
+        printf '\n%sКлиентская ссылка соберётся в панели сама. Её узнаваемые части:%s\n' "$C_DIM" "$C_RESET"
+        dim "type=xhttp  mode=stream-up  path=/$path  security=reality  sni=$DOMAIN"
+    fi
+
+    printf '\n'
+    warn "Панель пересоберёт конфиг и перезапустит Xray на ноде."
+    dim "Проверить после применения: rn logs -f"
+
+    state_mark "xhttp"
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Итог
 # ─────────────────────────────────────────────────────────────────────────────
 summary() {
     banner "Готово"
 
     printf '%sЧто сделано:%s\n' "$C_BOLD" "$C_RESET"
-    for k in system ssh tailscale dns remnanode selfsteal warp firewall bbr; do
+    for k in system ssh tailscale dns remnanode selfsteal warp firewall bbr xhttp; do
         if state_done "$k"; then
             printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$k"
         else
@@ -1595,7 +1684,7 @@ main() {
 
     preflight
 
-    printf '\n%sБудут выполнены 9 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
+    printf '\n%sБудут выполнены 10 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
     ask_yn "Начинаем?" y || { info "Отменено."; exit 0; }
 
     step_system
@@ -1609,6 +1698,7 @@ main() {
     # Без || это под set -e обрывает весь скрипт вместе с оставшимися шагами.
     step_firewall || warn "Шаг файрвола не завершён — подробности выше"
     step_bbr
+    step_xhttp
     summary
 }
 

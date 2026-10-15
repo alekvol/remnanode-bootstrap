@@ -22,13 +22,18 @@
 set -Eeuo pipefail
 
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.1.4"
+readonly BOOTSTRAP_VERSION="1.2.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
 readonly BACKUP_DIR="/root/remnanode-bootstrap-backups"
 
-readonly R_REMNANODE="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
+readonly NODE_DIR="/opt/remnanode"
+# Путь ВНУТРИ контейнера ноды: именно его указывают в tlsSettings.certificates
+# инбаунда Hysteria2 в конфиге Xray, который пушит панель.
+readonly NODE_CERT_IN_CONTAINER="/var/lib/remnawave/configs/xray/ssl"
+
+# remnanode.sh больше не используется: ноду ставим своим compose (шаг 5).
 readonly R_SELFSTEAL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 readonly R_WTM="https://github.com/DigneZzZ/remnawave-scripts/raw/main/wtm.sh"
 
@@ -124,6 +129,12 @@ should_run() {
 # Утилиты
 # ─────────────────────────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# docker compose для ноды. --project-directory нужен, чтобы env_file: .env
+# искался рядом с compose-файлом, а не в текущем каталоге.
+node_compose() {
+    docker compose -f "$NODE_DIR/docker-compose.yml" --project-directory "$NODE_DIR" "$@"
+}
 
 # Число ключей в authorized_keys. Считаем через ssh-keygen, а не grep:
 # он понимает и строки с опциями (restrict,command="..." ssh-ed25519 ...),
@@ -545,41 +556,167 @@ step_dns() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Шаг 5. Remnanode
 # ─────────────────────────────────────────────────────────────────────────────
+install_docker() {
+    have docker || {
+        info "Ставлю Docker из официального репозитория..."
+        export DEBIAN_FRONTEND=noninteractive
+        install -m 0755 -d /etc/apt/keyrings
+        local os_id
+        os_id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-debian}")
+        curl -fsSL "https://download.docker.com/linux/$os_id/gpg" \
+            -o /etc/apt/keyrings/docker.asc || { err "Не скачался ключ Docker"; return 1; }
+        chmod a+r /etc/apt/keyrings/docker.asc
+        local codename
+        codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
+        printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+            "$(dpkg --print-architecture)" "$os_id" "$codename" > /etc/apt/sources.list.d/docker.list
+        apt-get update -qq
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin >/dev/null \
+            || { err "Установка Docker не удалась"; return 1; }
+    }
+    docker compose version >/dev/null 2>&1 || { err "Плагин docker compose недоступен"; return 1; }
+    ok "Docker готов: $(docker --version)"
+}
+
+# Значение ключа из .env, без кавычек. Пустая строка, если ключа нет.
+env_value() {
+    local file="$1" key="$2" v=""
+    [[ -f "$file" ]] || return 1
+    v=$(grep -m1 -E "^[[:space:]]*$key=" "$file" 2>/dev/null | cut -d= -f2- | tr -d '"'\''[:space:]') || true
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
+}
+
 step_remnanode() {
     should_run "remnanode" "Remnanode" || return 0
     banner "Шаг 5/9 — Установка Remnanode"
 
-    if have docker; then
-        ok "Docker уже есть: $(docker --version)"
-    else
-        dim "Docker поставит сам скрипт remnanode.sh."
-    fi
-
-    printf '\n%sПеред запуском приготовьте SECRET_KEY из панели Remnawave:%s\n' "$C_DIM" "$C_RESET"
-    dim "  Панель → Nodes → Create/Manage node → скопировать ключ (строка вида eyJ...)"
-    printf '\n'
+    printf '%sСтавим ноду своим docker-compose, без внешнего установщика.%s\n' "$C_DIM" "$C_RESET"
+    printf '%sК штатному набору добавлены два тома: /dev/shm для unix-сокета%s\n' "$C_DIM" "$C_RESET"
+    printf '%sselfsteal и каталог с сертификатом — он нужен инбаунду Hysteria2.%s\n\n' "$C_DIM" "$C_RESET"
 
     if ! ask_yn "Устанавливать ноду сейчас?" y; then
         info "Пропускаю."; return 0
     fi
 
-    info "Скрипт задаст вопросы сам — отвечайте по подсказкам."
-    run_remote "$R_REMNANODE" "@" "install" || warn "remnanode.sh вернул ненулевой код"
+    install_docker || return 1
 
-    printf '\n'
-    if have remnanode; then
-        ok "CLI remnanode установлен"
-        remnanode status 2>/dev/null | sed 's/^/    /' || true
+    mkdir -p "$NODE_DIR/cert"
+    chmod 700 "$NODE_DIR"
+
+    # ── SECRET_KEY и порт ─────────────────────────────────────────────────
+    local secret="" port=""
+    secret=$(env_value "$NODE_DIR/.env" SECRET_KEY) || secret=""
+    port=$(env_value "$NODE_DIR/.env" NODE_PORT) || port=$(env_value "$NODE_DIR/.env" APP_PORT) || port=""
+
+    if [[ -n "$secret" ]]; then
+        ok "SECRET_KEY найден в $NODE_DIR/.env — переиспользую"
+        ask_yn "  Заменить на новый?" n && secret=""
+    fi
+    if [[ -z "$secret" ]]; then
+        printf '\n%sSECRET_KEY из панели: Nodes → Create/Manage node → скопировать eyJ...%s\n' "$C_DIM" "$C_RESET"
+        while true; do
+            ask_var secret "SECRET_KEY:" ""
+            [[ -n "$secret" ]] && break
+            warn "Пусто."
+        done
     fi
 
-    local compose="/opt/remnanode/docker-compose.yml"
-    if [[ -f "$compose" ]]; then
-        if grep -qE '^[[:space:]]+network_mode:[[:space:]]*host' "$compose"; then
-            ok "network_mode: host — вариант B WARP заработает"
-        else
-            warn "В compose нет network_mode: host — WARP вариант B работать НЕ будет"
-            dim "Файл: $compose"
-        fi
+    while true; do
+        ask_var port "Порт API ноды:" "${port:-2222}"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) && break
+        err "Нужно число 1–65535."
+    done
+    dim "Тот же порт должен стоять в записи ноды в панели."
+
+    # ── Версия образа ─────────────────────────────────────────────────────
+    # Нода 3.3.0+ рвёт TLS-хендшейк, если панель старее 3.3.0: она не шлёт
+    # производный SNI, и нода просто не выходит в онлайн с 'unknown sni'.
+    local tag="latest"
+    printf '\n'
+    warn "Нода 3.3.0+ работает только с панелью 3.3.0 и новее."
+    dim "На старой панели нода останется офлайн с 'unknown sni' в логах."
+    if ! ask_yn "Ваша панель 3.3.0 или новее?" y; then
+        tag="3.2.2"
+        info "Беру образ $tag — совместим со старой панелью."
+    fi
+    ask_var tag "Тег образа ноды:" "$tag"
+
+    # ── Файлы ─────────────────────────────────────────────────────────────
+    backup_file "$NODE_DIR/.env"
+    cat > "$NODE_DIR/.env" <<EOF
+### NODE ###
+NODE_PORT=$port
+
+### XRAY ###
+SECRET_KEY=$secret
+EOF
+    chmod 600 "$NODE_DIR/.env"
+    ok "Записан $NODE_DIR/.env"
+
+    backup_file "$NODE_DIR/docker-compose.yml"
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: ghcr.io/remnawave/node:$tag
+    env_file:
+      - .env
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      # unix-сокет selfsteal: REALITY отдаёт сюда чужой трафик
+      - /dev/shm:/dev/shm
+      # сертификат для инбаунда Hysteria2 (UDP 443)
+      - $NODE_DIR/cert:$NODE_CERT_IN_CONTAINER:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+    ok "Записан $NODE_DIR/docker-compose.yml"
+    dim "network_mode: host — нужен и для WARP (вариант B), и для XHTTP за nginx"
+
+    # Замена CLI remnanode, который ставил внешний установщик.
+    cat > /usr/local/bin/rn <<EOF
+#!/usr/bin/env bash
+# Обёртка над docker compose для ноды Remnawave. Создана remnanode-bootstrap.
+exec docker compose -f "$NODE_DIR/docker-compose.yml" --project-directory "$NODE_DIR" "\$@"
+EOF
+    chmod 755 /usr/local/bin/rn
+    ok "Команда rn установлена: rn ps, rn logs -f, rn restart"
+
+    # ── Запуск ────────────────────────────────────────────────────────────
+    info "Поднимаю контейнер..."
+    node_compose up -d || { err "docker compose up завершился с ошибкой"; return 1; }
+
+    sleep 3
+    if docker ps --filter name=remnanode --filter status=running --format '{{.Names}}' | grep -qx remnanode; then
+        ok "Контейнер remnanode работает"
+    else
+        err "Контейнер не поднялся"
+        node_compose logs --tail 30 2>&1 | sed 's/^/    /' || true
+        return 1
+    fi
+
+    if port_busy "$port"; then
+        ok "Порт $port слушается"
+    else
+        warn "Порт $port не слушается — панель до ноды не достучится"
+    fi
+
+    if node_compose logs --tail 200 2>&1 | grep -qi 'unknown sni'; then
+        err "В логах есть 'unknown sni' — панель старее ноды"
+        dim "Переустановите с тегом 3.2.2 либо обновите панель."
     fi
 
     state_mark "remnanode"
@@ -1108,8 +1245,9 @@ JSON
     printf '4. Теги в правилах routing должны совпадать посимвольно с тегами outbounds.\n'
 
     printf '\n%sПолезные команды:%s\n' "$C_BOLD" "$C_RESET"
-    dim "remnanode status            — состояние ноды"
-    dim "remnanode logs              — логи контейнера"
+    dim "rn ps                       — состояние ноды"
+    dim "rn logs -f                  — логи контейнера"
+    dim "rn restart                  — перезапуск ноды"
     dim "wtm status                  — состояние WARP"
     dim "systemctl status wg-quick@warp"
     dim "sshd -T | grep -i password  — проверить, что пароль отключён"

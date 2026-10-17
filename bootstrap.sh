@@ -185,7 +185,8 @@ readonly APT_LOCK_WAIT=600
 apt_update() {
     local i out
     for ((i = 0; i < APT_LOCK_WAIT / 10; i++)); do
-        out=$(apt-get update -q 2>&1) && { printf '%s\n' "$out" >>"$LOG_FILE"; return 0; }
+        # LC_ALL=C: ниже разбираем текст ошибки, а при LANG=ru_RU он переведён.
+        out=$(LC_ALL=C apt-get update -q 2>&1) && { printf '%s\n' "$out" >>"$LOG_FILE"; return 0; }
         printf '%s\n' "$out" >>"$LOG_FILE"
         grep -q 'Could not get lock' <<<"$out" || return 1
         ((i)) || info "apt занят другим процессом (обычно unattended-upgrades после загрузки) — жду до $((APT_LOCK_WAIT / 60)) минут..."
@@ -434,10 +435,10 @@ ssh_reload() {
 # и с -C, и без. Берём порт текущей сессии, иначе 22.
 readonly SSHD_TEST_SPEC="user=root,host=remnanode-check,addr=198.51.100.1"
 sshd_dump() {
-    local lport=22 c="${SSH_CONNECTION:-}"
+    local lport="${1:-}" c="${SSH_CONNECTION:-}"
     c="${c##* }"
-    [[ "$c" =~ ^[0-9]+$ ]] && lport="$c"
-    sshd -T -C "$SSHD_TEST_SPEC,lport=$lport" 2>/dev/null
+    [[ -z "$lport" && "$c" =~ ^[0-9]+$ ]] && lport="$c"
+    sshd -T -C "$SSHD_TEST_SPEC,lport=${lport:-22}" 2>/dev/null
 }
 
 step_ssh() {
@@ -575,32 +576,43 @@ EOF
     # permitrootlogin: при prohibit-password sshd сам отвергает пароль root,
     # даже если Match разрешил PasswordAuthentication. Дыра — только когда
     # Match вернул ещё и PermitRootLogin yes.
+    # Match LocalPort даёт разный итог на разных портах, поэтому проверяем
+    # каждый порт, на котором слушает SSH.
     printf '\n'
-    local eff pa kb pr pk bad=0
-    if ! eff=$(sshd_dump) || [[ -z "$eff" ]]; then
-        err "Не удалось проверить итоговые настройки: sshd -T -C завершился ошибкой"
-        bad=1
-    else
+    local eff pa kb pr pk bad=0 lp lports pw_root=0 pw_other=0 pk_bad=0
+    lports=$(ssh_ports) || lports=22
+    for lp in $lports; do
+        if ! eff=$(sshd_dump "$lp") || [[ -z "$eff" ]]; then
+            err "Не удалось проверить итоговые настройки для порта $lp: sshd -T -C завершился ошибкой"
+            bad=1
+            continue
+        fi
         pa=$(awk '$1=="passwordauthentication"{print $2}' <<<"$eff")
         kb=$(awk '$1=="kbdinteractiveauthentication"{print $2}' <<<"$eff")
         pr=$(awk '$1=="permitrootlogin"{print $2}' <<<"$eff")
         pk=$(awk '$1=="pubkeyauthentication"{print $2}' <<<"$eff")
-        dim "Для входа root снаружи (sshd -T -C): password=$pa kbd-interactive=$kb permitrootlogin=$pr pubkey=$pk"
+        dim "Вход root снаружи на порт $lp (sshd -T -C): password=$pa kbd-interactive=$kb permitrootlogin=$pr pubkey=$pk"
         if [[ "$pr" == yes && ( "$pa" != no || "$kb" != no ) ]]; then
-            err "root по-прежнему входит по паролю: это разрешает Match-блок (список выше)"
-            dim "Уберите из него PermitRootLogin yes / PasswordAuthentication yes / KbdInteractiveAuthentication yes"
-            bad=1
+            pw_root=1
         elif [[ "$pa" != no || "$kb" != no ]]; then
-            warn "Match-блок разрешает пароль, но не для root (permitrootlogin=$pr) — root его не примет"
-        else
-            ok "Вход по паролю отключён"
+            pw_other=1
         fi
-        if [[ "$pk" == yes ]]; then
-            ok "Вход по ключу включён"
-        else
-            err "pubkeyauthentication = $pk — вход по ключу не работает"
-            bad=1
-        fi
+        [[ "$pk" == yes ]] || pk_bad=1
+    done
+    if (( pw_root )); then
+        err "root по-прежнему входит по паролю: это разрешает Match-блок (список выше)"
+        dim "Уберите из него PermitRootLogin yes / PasswordAuthentication yes / KbdInteractiveAuthentication yes"
+        bad=1
+    elif (( pw_other )); then
+        warn "Match-блок разрешает пароль, но не для root — root его не примет"
+    elif (( ! bad )); then
+        ok "Вход по паролю отключён"
+    fi
+    if (( pk_bad )); then
+        err "pubkeyauthentication не yes — вход по ключу не работает"
+        bad=1
+    elif (( ! bad )); then
+        ok "Вход по ключу включён"
     fi
 
     # cloud-init может вернуть свой дропин после перезагрузки
@@ -749,16 +761,13 @@ step_dns() {
         }
     done
 
-    # Домен сменился: nginx и сертификат шага 6, а с ними подсказка шага 10,
-    # относятся к старому. Снимаем их отметки, чтобы следующие шаги
-    # выполнились заново, а не пропустились по Enter.
-    if [[ -n "$saved" && "$d" != "$saved" ]]; then
-        local k
-        for k in selfsteal xhttp; do
-            state_done "$k" || continue
-            state_unmark "$k"
-            warn "Домен сменился — шаг «$k» будет выполнен заново под $d"
-        done
+    # Домен сменился: nginx и сертификат шага 6 относятся к старому.
+    # Снимаем отметку, чтобы шаг выполнился заново, а не пропустился по Enter.
+    # Шаг 10 не трогаем: домена в инбаунде XHTTP нет, а повтор шага сменил
+    # бы путь, который уже стоит у клиентов.
+    if [[ -n "$saved" && "$d" != "$saved" ]] && state_done selfsteal; then
+        state_unmark selfsteal
+        warn "Домен сменился — шаг 6 (selfsteal) будет выполнен заново под $d"
     fi
 
     DOMAIN="$d"
@@ -819,7 +828,7 @@ add_docker_repo() {
 # Версия-кандидат пакета в apt; пусто, если пакета нет.
 apt_candidate() {
     local c
-    c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}') || true
+    c=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}') || true
     [[ -n "$c" && "$c" != "(none)" ]] && printf '%s' "$c"
 }
 
@@ -911,12 +920,14 @@ step_remnanode() {
     # SECRET_KEY="..." — тогда нода не авторизуется. Чиним и его.
     if [[ -n "$old" ]]; then
         secret=$(normalize_secret "$old")
-        if ! secret_ok "$secret"; then
+        if [[ ! "$secret" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]]; then
             warn "SECRET_KEY в $NODE_DIR/.env не похож на ключ из панели — нужно ввести заново"
             secret=""
         elif [[ "$secret" != "$old" ]]; then
             info "SECRET_KEY в $NODE_DIR/.env был записан с лишним префиксом — исправляю"
         fi
+        # Ключ не с eyJ мог быть подтверждён при прошлом вводе — не отвергаем.
+        [[ -n "$secret" ]] && ! secret_ok "$secret" && dim "Ключ не начинается с eyJ — так было при прошлом вводе."
     fi
     if [[ -n "$secret" ]]; then
         ok "SECRET_KEY найден в $NODE_DIR/.env — переиспользую"
@@ -948,7 +959,9 @@ step_remnanode() {
     [[ -z "$prev_port" ]] && port_busy "$def_port" && def_port=2223
     while true; do
         ask_var port "Порт API ноды:" "$def_port"
-        if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        # Без ведущих нулей: 08080 bash счёл бы восьмеричным и упал бы на
+        # арифметике, а в .env ушла бы строка, которую не поймёт ни ss, ни ufw.
+        if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || ((port > 65535)); then
             err "Нужно число 1–65535."; continue
         fi
         if port_busy "$port" && ! { [[ "$port" == "$prev_port" ]] && container_running remnanode; }; then
@@ -1203,7 +1216,12 @@ issue_cert() {
         cp -p "$conf" "$bak" || { err "Не удалось сохранить $conf"; return 1; }
         mark=$(wc -l <"$LOG_FILE" 2>/dev/null) || mark=0
         "${issue[@]}" --force >>"$LOG_FILE" 2>&1 || rc=$?
-        (( rc == 0 )) && { rm -f "$bak"; bak=""; }
+        if (( rc == 0 )); then
+            rm -f "$bak"; bak=""
+            # Порт TLS-ALPN от прежнего выпуска acme.sh не стирает, а обёртка
+            # продления selfsteal.sh по нему перенаправляет весь входящий 443.
+            sed -i '/^Le_TLSPort=/d' "$conf" 2>/dev/null || true
+        fi
     else
         info "Выпускаю сертификат через HTTP-01 (webroot на порту 80)..."
         "${issue[@]}" >>"$LOG_FILE" 2>&1 || rc=$?
@@ -1501,7 +1519,7 @@ selfsteal_setup() {
         [[ -f "$old_dir/docker-compose.yml" ]] || continue
         # Остановленную прошлым запуском не трогаем — и не поднимаем при неудаче.
         running=$(docker compose -f "$old_dir/docker-compose.yml" --project-directory "$old_dir" \
-                  ps -q --status running 2>/dev/null) || running=""
+                  ps -q --status running --status restarting 2>/dev/null) || running=""
         if [[ -z "$running" ]]; then
             dim "Прежняя установка $old_dir уже остановлена"
             continue
@@ -1875,7 +1893,8 @@ ssh_ports() {
         ports=$(systemctl show -p Listen --value ssh.socket 2>/dev/null \
             | awk '$2=="(Stream)"{n=split($1,a,":"); print a[n]}') || ports=""
     fi
-    if out=$(sshd_dump) && [[ -n "$out" ]]; then
+    # Порт из sshd_config при socket-активации не действует — не открываем лишний.
+    if [[ -z "$ports" ]] && out=$(sshd_dump) && [[ -n "$out" ]]; then
         ports+=$'\n'$(awk '$1=="listenaddress"{n=split($2,a,":"); print a[n]}' <<<"$out")
     fi
     [[ -n "$c" ]] && ports+=$'\n'"${c##* }"
@@ -2288,14 +2307,17 @@ step_xhttp() {
         info "Пропускаю."; return 0
     fi
 
-    local path tag sock="@xhttp"
+    local path="" tag sock="@xhttp" out="$STATE_DIR/xhttp-inbound.json"
+    # При повторе предлагаем прежний путь: он уже стоит в ссылках клиентов.
+    [[ -f "$out" ]] && path=$(sed -n 's#.*"path": *"/\([^"]*\)".*#\1#p' "$out" 2>/dev/null | head -1)
     # Путь не секрет, но угадываемый путь упрощает активное прощупывание.
-    path=$(openssl rand -hex 8 2>/dev/null) || path=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    [[ -n "$path" ]] || path=$(openssl rand -hex 8 2>/dev/null) \
+        || path=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     ask_var path "Путь XHTTP (без ведущего слэша):" "$path"
     path="${path#/}"
     ask_var tag "Тег инбаунда:" "VLESS-XHTTP"
 
-    local out="$STATE_DIR/xhttp-inbound.json"
+    backup_file "$out"
     cat > "$out" <<EOF
 {
   "tag": "$tag",

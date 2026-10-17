@@ -14,16 +14,26 @@
 #   9. BBR + fq
 #  10. Инбаунд VLESS XHTTP поверх REALITY
 #
-# Запуск от root, одной командой:
+# Запуск (подробности в README):
+#   curl -fsSL -o bootstrap.sh https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh
+#   bash bootstrap.sh              # от root; или sudo bash bootstrap.sh
+# или одной командой, только из root-шелла (через sudo не работает):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/alekvol/remnanode-bootstrap/main/bootstrap.sh)
 #
-# Через пайп (curl | bash) запускать нельзя: bash займёт stdin текстом самого
-# скрипта, и вложенным установщикам не останется канала для диалога.
+# Весь диалог и stdin дочерних процессов берутся из /dev/tty (см. конец
+# файла), поэтому пайп curl | bash тоже не ломает ввод. Но и он, и bash <(...)
+# возвращают 0, если скачать скрипт не удалось, — для автоматизации
+# скачивайте в файл.
 #
 set -Eeuo pipefail
 
+# su без «-» (util-linux) сохраняет PATH пользователя, а в Debian там нет
+# sbin: sshd, ufw, sysctl, modprobe и tc не находились бы, и sshd -t, например,
+# выдавался бы за ошибку в конфиге.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # Не VERSION: это имя занимает /etc/os-release, который мы сорсим в preflight.
-readonly BOOTSTRAP_VERSION="1.5.0"
+readonly BOOTSTRAP_VERSION="1.6.0"
 readonly STATE_DIR="/var/lib/remnanode-bootstrap"
 readonly STATE_FILE="$STATE_DIR/state"
 readonly LOG_FILE="/var/log/remnanode-bootstrap.log"
@@ -54,9 +64,10 @@ else
     C_BOLD=""; C_DIM=""
 fi
 
-# Лог не должен ронять вызывающего: до проверки на root файл в /var/log
-# недоступен на запись, а err() вызывается как раз в этот момент.
-log()      { printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+# Лог не должен ронять вызывающего и шуметь: до проверки на root файл в
+# /var/log недоступен на запись, а err() вызывается как раз в этот момент.
+# Группа нужна, чтобы 2>/dev/null действовал и на ошибку открытия файла.
+log()      { { printf '%s\n' "$*" >>"$LOG_FILE"; } 2>/dev/null || true; }
 info()     { printf '%s→%s %s\n' "$C_BLUE" "$C_RESET" "$*"; log "[INFO] $*"; }
 ok()       { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; log "[ OK ] $*"; }
 warn()     { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; log "[WARN] $*"; }
@@ -119,6 +130,7 @@ pause() {
 # ─────────────────────────────────────────────────────────────────────────────
 state_done()  { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
 state_mark()  { mkdir -p "$STATE_DIR"; echo "$1" >> "$STATE_FILE"; }
+state_unmark() { sed -i "/^$1\$/d" "$STATE_FILE" 2>/dev/null || true; }
 
 # Возвращает 0, если шаг нужно выполнять
 should_run() {
@@ -130,10 +142,106 @@ should_run() {
     return 0
 }
 
+# Ключи шагов, завершившихся ошибкой в этом запуске.
+FAILED_STEPS=()
+
+# run_step KEY FUNC — выполняет шаг и переживает его неудачу: остальные
+# шаги идут дальше, а итог покажет, что не получилось. Без этого return 1
+# из шага под set -e обрывал весь скрипт, и сервер оставался, например,
+# без файрвола.
+#
+# Внимание: функция, вызванная в контексте ||, выполняется с выключенным
+# set -e — bash так устроен. Поэтому шаги проверяют важные команды сами
+# (|| return 1), а не надеются на errexit.
+run_step() {
+    local key="$1" fn="$2"
+    "$fn" && return 0
+    FAILED_STEPS+=("$key")
+    # Отметка прошлого успешного запуска больше не верна: иначе следующий
+    # запуск предложил бы пропустить упавший шаг, а итог показал бы ✓.
+    state_unmark "$key"
+    warn "Шаг «$key» не завершён — подробности выше. Продолжаю со следующего."
+    return 0
+}
+
+step_failed() {
+    local k
+    for k in "${FAILED_STEPS[@]}"; do [[ "$k" == "$1" ]] && return 0; done
+    return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Утилиты
 # ─────────────────────────────────────────────────────────────────────────────
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# На свежей VPS в первые минуты после загрузки apt держат unattended-upgrades
+# и cloud-init. У apt-get, в отличие от apt, тайм-аут блокировки dpkg по
+# умолчанию 0 — он сразу падает. DPkg::Lock::Timeout заставляет ждать.
+readonly APT_LOCK_WAIT=600
+
+# apt-get update с ожиданием блокировки списков пакетов: DPkg::Lock::Timeout
+# на /var/lib/apt/lists/lock не действует, поэтому повторяем сами.
+apt_update() {
+    local i out
+    for ((i = 0; i < APT_LOCK_WAIT / 10; i++)); do
+        # LC_ALL=C: ниже разбираем текст ошибки, а при LANG=ru_RU он переведён.
+        out=$(LC_ALL=C apt-get update -q 2>&1) && { printf '%s\n' "$out" >>"$LOG_FILE"; return 0; }
+        printf '%s\n' "$out" >>"$LOG_FILE"
+        grep -q 'Could not get lock' <<<"$out" || return 1
+        ((i)) || info "apt занят другим процессом (обычно unattended-upgrades после загрузки) — жду до $((APT_LOCK_WAIT / 60)) минут..."
+        sleep 10
+    done
+    return 1
+}
+
+# apt-get install с выводом в лог. confdef/confold — чтобы dpkg не задал
+# вопрос про изменённый конфиг: вывод уходит в лог, и вопрос висел бы
+# невидимым. Если пакет не нашёлся (списки устарели — шаг 1 мог пройти
+# давно), обновляем списки и пробуем ещё раз.
+apt_install() {
+    local opts=(-y -q -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT"
+                -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install "${opts[@]}" "$@" >>"$LOG_FILE" 2>&1 && return 0
+    apt_update || return 1
+    apt-get install "${opts[@]}" "$@" >>"$LOG_FILE" 2>&1
+}
+
+# Дождаться, пока dpkg освободится, ничего не ставя. Нужно перед чужими
+# установщиками (install.sh Tailscale), которые блокировку не ждут.
+apt_wait_lock() {
+    apt-get install -y -q -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT" >>"$LOG_FILE" 2>&1 || true
+}
+
+# Запущен ли контейнер с этим именем. Нужен, чтобы при повторном запуске
+# не принимать за конфликт порты, которые держат наши же контейнеры.
+container_running() {
+    have docker || return 1
+    docker ps --filter "name=^$1\$" --filter status=running --format '{{.Names}}' 2>/dev/null \
+        | grep -qx "$1"
+}
+
+# Контейнер selfsteal.sh от прежних версий скрипта (до 1.3) держит 80
+# (network_mode: host). Шаг 6 сам предложит его остановить. Одного
+# compose-файла мало: шаг 6 оставляет файлы старой установки на месте.
+legacy_selfsteal_running() {
+    { [[ -f /opt/nginx-selfsteal/docker-compose.yml ]] && container_running nginx-selfsteal; } \
+        || { [[ -f /opt/caddy/docker-compose.yml ]] && container_running caddy-selfsteal; }
+}
+
+# Под tmux/screen обрыв SSH не убивает установку. Переменные TMUX и STY
+# sudo вычищает, поэтому смотрим ещё и на предков процесса.
+under_multiplexer() {
+    [[ -n "${TMUX:-}${STY:-}${ZELLIJ:-}" ]] && return 0
+    local pid=$$ comm
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+        case "$comm" in tmux*|screen*|SCREEN*|zellij*|mosh-server*) return 0 ;; esac
+        pid=$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null) || return 1
+    done
+    return 1
+}
 
 # docker compose для ноды. --project-directory нужен, чтобы env_file: .env
 # искался рядом с compose-файлом, а не в текущем каталоге.
@@ -174,16 +282,42 @@ port_busy() {
     return 1
 }
 
+# Метки из латиницы, цифр и дефиса; зона — буквы или punycode
+# (xn--p1ai — это .рф, без него кириллические домены отвергались).
+valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+([a-zA-Z]{2,}|xn--[a-zA-Z0-9-]+)$ ]]
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Предварительные проверки
 # ─────────────────────────────────────────────────────────────────────────────
 preflight() {
     banner "Предварительные проверки"
 
-    # Не подсказываем sudo: на минимальных образах его нет, а при запуске
-    # через bash <(...) в $0 лежит /dev/fd/63 и совет получился бы бессмысленным.
-    [[ $EUID -eq 0 ]] || die "Нужен root. Зайдите под root и запустите заново."
+    # Не подсказываем «sudo $0»: на минимальных образах sudo нет, а при запуске
+    # через bash <(...) в $0 лежит /dev/fd/63, и через sudo он не откроется.
+    [[ $EUID -eq 0 ]] || die "Нужен root. Зайдите под root (или sudo -i) и запустите заново."
     ok "Запущено от root"
+
+    # Под sudo без -i в HOME может остаться каталог пользователя, и ключ
+    # SSH с acme.sh легли бы к нему, а не к root.
+    local root_home
+    root_home=$(getent passwd root 2>/dev/null | cut -d: -f6) || root_home=""
+    if [[ -n "$root_home" && "$HOME" != "$root_home" ]]; then
+        export HOME="$root_home"
+        dim "HOME переключён на $root_home"
+    fi
+
+    # Шаги 3 и 5 уводят в браузер, apt и выпуск сертификата идут минутами.
+    # Оборвись SSH в это время — bash получит SIGHUP и умрёт посреди шага.
+    if under_multiplexer; then
+        ok "Сессия под tmux/screen — обрыв SSH установку не прервёт"
+    else
+        warn "Запуск не под tmux/screen: обрыв SSH прервёт установку посреди шага."
+        dim "Надёжнее: apt-get install -y tmux && tmux new -s rn, запустить скрипт там,"
+        dim "а после обрыва вернуться командой tmux attach -t rn."
+        ask_yn "  Продолжить без tmux?" y || exit 0
+    fi
 
     [[ -r /etc/os-release ]] || die "Не найден /etc/os-release"
     # Сорсим в субшелле: os-release определяет VERSION, NAME и прочие общие
@@ -210,10 +344,8 @@ preflight() {
     # (и public_ip) без него молча превращаются в «нет сети».
     if ! have curl; then
         warn "curl не установлен — ставлю, он нужен для проверок ниже"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq \
-            && apt-get install -y -qq curl ca-certificates >/dev/null \
-            || die "Не удалось установить curl — проверьте apt и сеть"
+        apt_install curl ca-certificates \
+            || die "Не удалось установить curl — проверьте apt и сеть, лог: $LOG_FILE"
         have curl || die "curl не появился после установки"
         ok "curl установлен"
     fi
@@ -228,17 +360,28 @@ preflight() {
     SERVER_IP=$(public_ip) || die "Не удалось определить внешний IPv4"
     ok "Внешний IP сервера: $C_BOLD$SERVER_IP$C_RESET"
 
-    local warn_ports=()
+    # 80 нужен nginx для выпуска и продления сертификата (HTTP-01), 443 —
+    # Xray под REALITY. При повторном запуске их держат наши же контейнеры,
+    # и это не конфликт: иначе Enter (ответ по умолчанию) завершал бы скрипт.
+    local warn_ports=() p
     for p in 80 443; do
-        port_busy "$p" && warn_ports+=("$p")
+        port_busy "$p" || continue
+        [[ "$p" == 80 ]] && container_running "$SS_CONTAINER" && continue
+        [[ "$p" == 443 ]] && container_running remnanode && continue
+        if [[ "$p" == 80 ]] && legacy_selfsteal_running; then
+            dim "Порт 80 держит прежняя установка selfsteal.sh — шаг 6 предложит её остановить"
+            dim "(на «Выполнить заново?» шага 6 ответьте y)."
+            continue
+        fi
+        warn_ports+=("$p")
     done
     if ((${#warn_ports[@]})); then
-        warn "Порты уже заняты: ${warn_ports[*]}"
-        dim "Selfsteal требует свободные 80 и 443 на время выпуска сертификата."
+        warn "Порты заняты сторонними процессами: ${warn_ports[*]}"
+        dim "80 нужен nginx для выпуска и продления сертификата, 443 — Xray под REALITY."
         ss -tlnp "( sport = :80 or sport = :443 )" 2>/dev/null | sed 's/^/    /' || true
         ask_yn "  Всё равно продолжить?" n || exit 0
     else
-        ok "Порты 80 и 443 свободны"
+        ok "Порты 80 и 443 свободны (или заняты нашими же контейнерами)"
     fi
 }
 
@@ -251,12 +394,13 @@ step_system() {
 
     info "Обновляю списки пакетов..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
+    apt_update \
+        || { err "apt-get update не удался, смотрите $LOG_FILE"; return 1; }
 
     local pkgs=(curl wget ca-certificates gnupg jq git dnsutils
                 iproute2 nano less openssl cron)
     info "Ставлю базовые пакеты: ${pkgs[*]}"
-    apt-get install -y -qq "${pkgs[@]}" >/dev/null
+    apt_install "${pkgs[@]}" || { err "Не удалось поставить пакеты, смотрите $LOG_FILE"; return 1; }
     ok "Пакеты установлены"
 
     state_mark "system"
@@ -266,6 +410,7 @@ step_system() {
 # Шаг 2. SSH по ключу
 # ─────────────────────────────────────────────────────────────────────────────
 ssh_reload() {
+    have sshd || { err "sshd не найден в PATH ($PATH) — НЕ перезапускаю"; return 1; }
     if ! sshd -t; then
         err "sshd -t нашёл ошибку в конфиге — НЕ перезапускаю"
         return 1
@@ -283,7 +428,18 @@ ssh_reload() {
     return 0
 }
 
-sshd_effective() { sshd -T 2>/dev/null | grep -iE "^$1 " | awk '{print $2}'; }
+# Итоговый конфиг sshd для типичного входа root снаружи. Без -C sshd -T
+# показывает только глобальные значения, а Match-блок из дропина провайдера
+# (Match User root / PasswordAuthentication yes) молча вернул бы пароль.
+# lport обязателен: при Match LocalPort в конфиге sshd -T без него падает —
+# и с -C, и без. Берём порт текущей сессии, иначе 22.
+readonly SSHD_TEST_SPEC="user=root,host=remnanode-check,addr=198.51.100.1"
+sshd_dump() {
+    local lport="${1:-}" c="${SSH_CONNECTION:-}"
+    c="${c##* }"
+    [[ -z "$lport" && "$c" =~ ^[0-9]+$ ]] && lport="$c"
+    sshd -T -C "$SSHD_TEST_SPEC,lport=${lport:-22}" 2>/dev/null
+}
 
 step_ssh() {
     should_run "ssh" "Настройка SSH" || return 0
@@ -320,7 +476,13 @@ step_ssh() {
                 if grep -qxF "$pubkey" "$akfile"; then
                     warn "Такой ключ уже есть — пропускаю"
                 else
-                    printf '%s\n' "$pubkey" >> "$akfile"
+                    backup_file "$akfile"
+                    # Файл без \n в конце (ручная правка, панель хостера):
+                    # иначе ключ приклеился бы к последней строке и сломал оба.
+                    if [[ -s "$akfile" && -n "$(tail -c1 "$akfile")" ]]; then
+                        printf '\n' >> "$akfile" || { err "Не удалось записать $akfile"; return 1; }
+                    fi
+                    printf '%s\n' "$pubkey" >> "$akfile" || { err "Не удалось записать $akfile"; return 1; }
                     ok "Ключ добавлен в $akfile"
                 fi
                 break
@@ -367,7 +529,15 @@ step_ssh() {
     grep -rlE '^\s*(PasswordAuthentication|PermitRootLogin)\s' \
         /etc/ssh/sshd_config.d/ 2>/dev/null | sed 's/^/    /' || dim "    (не найдено)"
 
-    sed -i '/# >>> remnanode-bootstrap/,/# <<< remnanode-bootstrap/d' "$cfg"
+    # Блок перед Include перекрывает глобальные значения, но не Match-блоки:
+    # внутри Match действует своё значение для совпавших подключений.
+    if grep -rqiE '^\s*Match\s' "$cfg" /etc/ssh/sshd_config.d/ 2>/dev/null; then
+        warn "В конфиге есть Match-блоки — они переопределяют настройки для части входов:"
+        grep -rniE '^\s*Match\s' "$cfg" /etc/ssh/sshd_config.d/ 2>/dev/null | sed 's/^/    /'
+    fi
+
+    sed -i '/# >>> remnanode-bootstrap/,/# <<< remnanode-bootstrap/d' "$cfg" \
+        || { err "Не удалось отредактировать $cfg"; return 1; }
 
     local block
     block=$(cat <<'EOF'
@@ -386,12 +556,12 @@ EOF
         awk -v b="$block" '
             /^[[:space:]]*Include[[:space:]]/ && !ins { print b; print ""; ins=1 }
             { print }
-        ' "$cfg" > "$cfg.new"
-        mv "$cfg.new" "$cfg"
+        ' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg" \
+            || { err "Не удалось записать $cfg"; return 1; }
         dim "Блок вставлен перед строкой Include"
     else
-        { printf '%s\n\n' "$block"; cat "$cfg"; } > "$cfg.new"
-        mv "$cfg.new" "$cfg"
+        { printf '%s\n\n' "$block"; cat "$cfg"; } > "$cfg.new" && mv "$cfg.new" "$cfg" \
+            || { err "Не удалось записать $cfg"; return 1; }
         dim "Блок добавлен в начало файла (Include отсутствует)"
     fi
 
@@ -402,14 +572,48 @@ EOF
         die "SSH не настроен — разберитесь вручную перед продолжением"
     fi
 
+    # Сверяем итог для входа root снаружи, с учётом Match-блоков. Решает
+    # permitrootlogin: при prohibit-password sshd сам отвергает пароль root,
+    # даже если Match разрешил PasswordAuthentication. Дыра — только когда
+    # Match вернул ещё и PermitRootLogin yes.
+    # Match LocalPort даёт разный итог на разных портах, поэтому проверяем
+    # каждый порт, на котором слушает SSH.
     printf '\n'
-    local pa pr pk
-    pa=$(sshd_effective passwordauthentication)
-    pr=$(sshd_effective permitrootlogin)
-    pk=$(sshd_effective pubkeyauthentication)
-    [[ "$pa" == "no"  ]] && ok "passwordauthentication = no"  || err "passwordauthentication = $pa"
-    [[ "$pk" == "yes" ]] && ok "pubkeyauthentication = yes"   || err "pubkeyauthentication = $pk"
-    ok "permitrootlogin = $pr"
+    local eff pa kb pr pk bad=0 lp lports pw_root=0 pw_other=0 pk_bad=0
+    lports=$(ssh_ports) || lports=22
+    for lp in $lports; do
+        if ! eff=$(sshd_dump "$lp") || [[ -z "$eff" ]]; then
+            err "Не удалось проверить итоговые настройки для порта $lp: sshd -T -C завершился ошибкой"
+            bad=1
+            continue
+        fi
+        pa=$(awk '$1=="passwordauthentication"{print $2}' <<<"$eff")
+        kb=$(awk '$1=="kbdinteractiveauthentication"{print $2}' <<<"$eff")
+        pr=$(awk '$1=="permitrootlogin"{print $2}' <<<"$eff")
+        pk=$(awk '$1=="pubkeyauthentication"{print $2}' <<<"$eff")
+        dim "Вход root снаружи на порт $lp (sshd -T -C): password=$pa kbd-interactive=$kb permitrootlogin=$pr pubkey=$pk"
+        if [[ "$pr" == yes && ( "$pa" != no || "$kb" != no ) ]]; then
+            pw_root=1
+        elif [[ "$pa" != no || "$kb" != no ]]; then
+            pw_other=1
+        fi
+        [[ "$pk" == yes ]] || pk_bad=1
+    done
+    if (( pw_root )); then
+        err "root по-прежнему входит по паролю: это разрешает Match-блок (список выше)"
+        dim "Уберите из него PermitRootLogin yes / PasswordAuthentication yes / KbdInteractiveAuthentication yes"
+        bad=1
+    elif (( pw_other )); then
+        warn "Match-блок разрешает пароль, но не для root — root его не примет"
+    elif (( ! bad )); then
+        ok "Вход по паролю отключён"
+    fi
+    if (( pk_bad )); then
+        err "pubkeyauthentication не yes — вход по ключу не работает"
+        bad=1
+    elif (( ! bad )); then
+        ok "Вход по ключу включён"
+    fi
 
     # cloud-init может вернуть свой дропин после перезагрузки
     if [[ -f /etc/cloud/cloud.cfg ]] && ! grep -q '^ssh_pwauth:' /etc/cloud/cloud.cfg; then
@@ -419,6 +623,10 @@ EOF
 
     warn "Проверьте вход по ключу ЕЩЁ РАЗ, не закрывая эту сессию."
     pause
+    if (( bad )); then
+        dim "Исправьте и запустите скрипт снова — шаг 2 выполнится заново."
+        return 1
+    fi
     state_mark "ssh"
 }
 
@@ -437,8 +645,12 @@ step_tailscale() {
         ok "Tailscale уже установлен: $(tailscale version | head -1)"
     else
         info "Ставлю Tailscale..."
-        curl -fsSL https://tailscale.com/install.sh | sh
-        have tailscale || die "Установка Tailscale не удалась"
+        # install.sh от Tailscale блокировку dpkg не ждёт и падал бы, пока
+        # после загрузки работает unattended-upgrades.
+        apt_wait_lock
+        curl -fsSL https://tailscale.com/install.sh | sh \
+            || { err "Установка Tailscale не удалась"; return 1; }
+        have tailscale || { err "tailscale не найден после установки"; return 1; }
         ok "Tailscale установлен"
     fi
 
@@ -461,7 +673,11 @@ step_tailscale() {
         if tailscale status >/dev/null 2>&1; then
             ok "Подключено. Tailscale IP: $(tailscale ip -4 2>/dev/null | head -1)"
         else
-            warn "Не подключено — можно доделать позже: tailscale up --ssh"
+            # Не отмечаем шаг: интерфейс tailscale0 при этом уже есть, и шаг 8
+            # иначе закрыл бы порт ноды на тейлнет без единого пира.
+            err "Не подключено: tailscale up не прошёл (просроченный или уже использованный auth key?)"
+            dim "Доделать вручную: tailscale up --ssh — или запустите скрипт снова."
+            return 1
         fi
     fi
 
@@ -486,7 +702,7 @@ step_dns() {
 
     banner "Шаг 4/10 — A-запись домена"
 
-    printf '%sSelfsteal выпускает сертификат Let'"'"'s Encrypt через TLS-ALPN на 443.%s\n' "$C_DIM" "$C_RESET"
+    printf '%sСертификат Let'"'"'s Encrypt выпускается по HTTP-01 через порт 80.%s\n' "$C_DIM" "$C_RESET"
     printf '%sДля этого домен ОБЯЗАН резолвиться в IP этого сервера.%s\n\n' "$C_DIM" "$C_RESET"
 
     printf '  %sДобавьте у регистратора или в панели DNS:%s\n' "$C_BOLD" "$C_RESET"
@@ -495,21 +711,28 @@ step_dns() {
     printf '      %sЗначение:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$SERVER_IP" "$C_RESET"
     printf '      %sTTL:%s   минимальный (60–300)\n\n' "$C_DIM" "$C_RESET"
     warn "Если домен за Cloudflare — проксирование (оранжевое облако) должно быть ВЫКЛЮЧЕНО."
-    dim "TLS-ALPN требует, чтобы 443 отвечал ваш сервер, а не CDN."
+    dim "Иначе на 80 и 443 ответит CDN: сертификат не выпустится, а REALITY не заработает."
     printf '\n'
 
+    # Ввод держим в локальной d, а в DOMAIN кладём только вместе с записью в
+    # файл. Иначе отказ от повторного ввода оставлял бы в DOMAIN отвергнутую
+    # строку, и шаги 6 и 10 взяли бы её вместо сохранённого домена.
+    local d="${DOMAIN:-}" resolved
     while true; do
-        ask_var DOMAIN "Полный домен для selfsteal (например seafile.example.com):" "${DOMAIN:-}"
+        ask_var d "Полный домен для selfsteal (например seafile.example.com):" "$d"
 
-        if [[ -z "$DOMAIN" ]]; then
+        if [[ -z "$d" ]]; then
             warn "Домен не введён."
             ask_yn "  Пропустить шаг целиком?" y && { info "Пропускаю."; return 0; }
+            d="${DOMAIN:-}"
             continue
         fi
 
-        if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+        if ! valid_domain "$d"; then
             err "Домен выглядит некорректно."
+            dim "Кириллический домен вводите в punycode: сайт.рф → xn--80aswg.xn--p1ai"
             ask_yn "  Ввести заново?" y || { info "Пропускаю шаг."; return 0; }
+            d="${DOMAIN:-}"   # отвергнутую строку умолчанием не подставляем
             continue
         fi
 
@@ -520,17 +743,16 @@ step_dns() {
             break
         fi
 
-        info "Проверяю A-запись $DOMAIN..."
-        local resolved
-        resolved=$(dig +short A "$DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | tail -1 || true)
+        info "Проверяю A-запись $d..."
+        resolved=$(dig +short A "$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | tail -1 || true)
 
         if [[ -z "$resolved" ]]; then
             err "A-запись не найдена. DNS ещё не распространился или запись не создана."
         elif [[ "$resolved" == "$SERVER_IP" ]]; then
-            ok "$DOMAIN → $resolved (совпадает с IP сервера)"
+            ok "$d → $resolved (совпадает с IP сервера)"
             break
         else
-            err "$DOMAIN → $resolved, а сервер имеет $SERVER_IP"
+            err "$d → $resolved, а сервер имеет $SERVER_IP"
             dim "Если это IP Cloudflare — отключите проксирование."
         fi
 
@@ -539,33 +761,110 @@ step_dns() {
         }
     done
 
-    echo "$DOMAIN" > "$STATE_DIR/domain"
+    # Домен сменился: nginx и сертификат шага 6 относятся к старому.
+    # Снимаем отметку, чтобы шаг выполнился заново, а не пропустился по Enter.
+    # Шаг 10 не трогаем: домена в инбаунде XHTTP нет, а повтор шага сменил
+    # бы путь, который уже стоит у клиентов.
+    if [[ -n "$saved" && "$d" != "$saved" ]] && state_done selfsteal; then
+        state_unmark selfsteal
+        warn "Домен сменился — шаг 6 (selfsteal) будет выполнен заново под $d"
+    fi
+
+    DOMAIN="$d"
+    echo "$DOMAIN" > "$STATE_DIR/domain" || { err "Не удалось сохранить домен в $STATE_DIR/domain"; return 1; }
     state_mark "dns"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Шаг 5. Remnanode
 # ─────────────────────────────────────────────────────────────────────────────
+# Дистрибутив и кодовое имя для репозитория Docker: "<debian|ubuntu> <codename>".
+# Preflight пускает и производные (Mint, Pop!_OS — по ID_LIKE), а у
+# download.docker.com есть только debian и ubuntu, причём с их кодовыми
+# именами, а не производных.
+docker_repo_target() {
+    local id like codename
+    id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
+    like=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")
+    case "$id" in
+        debian|ubuntu)
+            codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}") ;;
+        *)
+            if [[ "$like" == *ubuntu* ]]; then
+                id=ubuntu
+                codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${UBUNTU_CODENAME:-}")
+            else
+                id=debian
+                codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${DEBIAN_CODENAME:-}")
+            fi ;;
+    esac
+    [[ "$codename" =~ ^[a-z]+$ ]] || return 1
+    printf '%s %s' "$id" "$codename"
+}
+
+# Подключает официальный репозиторий Docker. Если apt-get update с ним не
+# проходит, docker.list убирается: битый список ломает любой следующий
+# apt-get update, в том числе повторный шаг 1.
+readonly DOCKER_LIST=/etc/apt/sources.list.d/docker.list
+add_docker_repo() {
+    local target os_id codename
+    target=$(docker_repo_target) \
+        || { err "Не удалось определить дистрибутив и кодовое имя для репозитория Docker"; return 1; }
+    read -r os_id codename <<<"$target"
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/$os_id/gpg" \
+        -o /etc/apt/keyrings/docker.asc || { err "Не скачался ключ Docker"; return 1; }
+    chmod a+r /etc/apt/keyrings/docker.asc
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+        "$(dpkg --print-architecture)" "$os_id" "$codename" > "$DOCKER_LIST" \
+        || { err "Не удалось записать $DOCKER_LIST"; return 1; }
+    if ! apt_update; then
+        rm -f "$DOCKER_LIST"
+        err "Репозиторий Docker для $os_id $codename недоступен, смотрите $LOG_FILE"
+        return 1
+    fi
+}
+
+# Версия-кандидат пакета в apt; пусто, если пакета нет.
+apt_candidate() {
+    local c
+    c=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}') || true
+    [[ -n "$c" && "$c" != "(none)" ]] && printf '%s' "$c"
+}
+
 install_docker() {
-    have docker || {
+    if ! have docker; then
         info "Ставлю Docker из официального репозитория..."
-        export DEBIAN_FRONTEND=noninteractive
-        install -m 0755 -d /etc/apt/keyrings
-        local os_id
-        os_id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-debian}")
-        curl -fsSL "https://download.docker.com/linux/$os_id/gpg" \
-            -o /etc/apt/keyrings/docker.asc || { err "Не скачался ключ Docker"; return 1; }
-        chmod a+r /etc/apt/keyrings/docker.asc
-        local codename
-        codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-        printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
-            "$(dpkg --print-architecture)" "$os_id" "$codename" > /etc/apt/sources.list.d/docker.list
-        apt-get update -qq
-        apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin >/dev/null \
-            || { err "Установка Docker не удалась"; return 1; }
-    }
-    docker compose version >/dev/null 2>&1 || { err "Плагин docker compose недоступен"; return 1; }
+        add_docker_repo || return 1
+        if ! apt_install docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin; then
+            rm -f "$DOCKER_LIST"
+            err "Установка Docker не удалась, смотрите $LOG_FILE"
+            return 1
+        fi
+    fi
+
+    # Docker из пакета дистрибутива (docker.io) ставится без compose. Плагин
+    # есть в Ubuntu (docker-compose-v2) и в Debian 13 (docker-compose 2.x).
+    # В Debian 12 docker-compose — это python-версия 1.x: она даёт только
+    # команду docker-compose, а не плагин, поэтому её пропускаем и берём
+    # docker-compose-plugin из репозитория Docker. С docker.io он не конфликтует.
+    if ! docker compose version >/dev/null 2>&1; then
+        info "Плагина docker compose нет — доставляю..."
+        apt_update || warn "apt-get update не прошёл, смотрите $LOG_FILE"
+        local pkg cand
+        for pkg in docker-compose-plugin docker-compose-v2 docker-compose; do
+            cand=$(apt_candidate "$pkg") || continue
+            [[ "$pkg" == docker-compose && "$cand" != 2* ]] && continue
+            apt_install "$pkg" && docker compose version >/dev/null 2>&1 && break
+        done
+        if ! docker compose version >/dev/null 2>&1 && [[ ! -f "$DOCKER_LIST" ]]; then
+            info "В репозиториях дистрибутива плагина нет — беру docker-compose-plugin у Docker"
+            add_docker_repo && apt_install docker-compose-plugin
+        fi
+        docker compose version >/dev/null 2>&1 \
+            || { err "Плагин docker compose недоступен, смотрите $LOG_FILE"; return 1; }
+    fi
     ok "Docker готов: $(docker --version)"
 }
 
@@ -577,6 +876,22 @@ env_value() {
     [[ -n "$v" ]] || return 1
     printf '%s' "$v"
 }
+
+# Из панели нередко копируют всю строку SECRET_KEY="eyJ..." вместо самого
+# токена — тогда в .env попадало SECRET_KEY=SECRET_KEY="...", и нода не
+# проходила авторизацию, хотя контейнер «работал».
+normalize_secret() {
+    local s="$1"
+    s="${s//\"/}"; s="${s//\'/}"
+    s="${s//[[:space:]]/}"
+    s="${s#export}"
+    # В цикле: в .env от прошлых версий бывает и SECRET_KEY=SECRET_KEY=...
+    while [[ "$s" == SECRET_KEY=* ]]; do s="${s#SECRET_KEY=}"; done
+    printf '%s' "$s"
+}
+
+# Похоже ли на SECRET_KEY из панели: base64 от JSON, то есть начинается с eyJ.
+secret_ok() { [[ "$1" =~ ^[A-Za-z0-9+/=_-]{20,}$ && "$1" == eyJ* ]]; }
 
 step_remnanode() {
     should_run "remnanode" "Remnanode" || return 0
@@ -592,14 +907,28 @@ step_remnanode() {
 
     install_docker || return 1
 
-    mkdir -p "$NODE_DIR"
-    chmod 700 "$NODE_DIR"
+    mkdir -p "$NODE_DIR" && chmod 700 "$NODE_DIR" \
+        || { err "Не удалось создать $NODE_DIR"; return 1; }
 
     # ── SECRET_KEY и порт ─────────────────────────────────────────────────
-    local secret="" port=""
-    secret=$(env_value "$NODE_DIR/.env" SECRET_KEY) || secret=""
+    local secret="" port="" old="" prev_port=""
+    old=$(env_value "$NODE_DIR/.env" SECRET_KEY) || old=""
     port=$(env_value "$NODE_DIR/.env" NODE_PORT) || port=$(env_value "$NODE_DIR/.env" APP_PORT) || port=""
+    prev_port="$port"
 
+    # .env от прошлых версий мог сохранить ключ вместе с префиксом
+    # SECRET_KEY="..." — тогда нода не авторизуется. Чиним и его.
+    if [[ -n "$old" ]]; then
+        secret=$(normalize_secret "$old")
+        if [[ ! "$secret" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]]; then
+            warn "SECRET_KEY в $NODE_DIR/.env не похож на ключ из панели — нужно ввести заново"
+            secret=""
+        elif [[ "$secret" != "$old" ]]; then
+            info "SECRET_KEY в $NODE_DIR/.env был записан с лишним префиксом — исправляю"
+        fi
+        # Ключ не с eyJ мог быть подтверждён при прошлом вводе — не отвергаем.
+        [[ -n "$secret" ]] && ! secret_ok "$secret" && dim "Ключ не начинается с eyJ — так было при прошлом вводе."
+    fi
     if [[ -n "$secret" ]]; then
         ok "SECRET_KEY найден в $NODE_DIR/.env — переиспользую"
         ask_yn "  Заменить на новый?" n && secret=""
@@ -608,15 +937,40 @@ step_remnanode() {
         printf '\n%sSECRET_KEY из панели: Nodes → Create/Manage node → скопировать eyJ...%s\n' "$C_DIM" "$C_RESET"
         while true; do
             ask_var secret "SECRET_KEY:" ""
-            [[ -n "$secret" ]] && break
-            warn "Пусто."
+            secret=$(normalize_secret "$secret")
+            if [[ -z "$secret" ]]; then
+                warn "Пусто."
+            elif [[ ! "$secret" =~ ^[A-Za-z0-9+/=_-]{20,}$ ]]; then
+                err "Это не похоже на SECRET_KEY: нужна одна строка base64 вида eyJ..."
+            elif [[ "$secret" != eyJ* ]]; then
+                warn "Ключ обычно начинается с eyJ, а этот — нет."
+                ask_yn "  Всё равно использовать?" n && break
+            else
+                break
+            fi
         done
     fi
 
+    # Занятый порт нода не забиндит и уйдёт в цикл перезапусков, а проверка
+    # «порт слушается» после запуска увидела бы чужой процесс — например,
+    # sshd, перенесённый на популярный 2222. Свободен он должен быть до
+    # запуска; исключение — его уже держит наша же нода с прошлого раза.
+    local def_port="${port:-2222}"
+    [[ -z "$prev_port" ]] && port_busy "$def_port" && def_port=2223
     while true; do
-        ask_var port "Порт API ноды:" "${port:-2222}"
-        [[ "$port" =~ ^[0-9]+$ ]] && ((port > 0 && port < 65536)) && break
-        err "Нужно число 1–65535."
+        ask_var port "Порт API ноды:" "$def_port"
+        # Без ведущих нулей: 08080 bash счёл бы восьмеричным и упал бы на
+        # арифметике, а в .env ушла бы строка, которую не поймёт ни ss, ни ufw.
+        if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || ((port > 65535)); then
+            err "Нужно число 1–65535."; continue
+        fi
+        if port_busy "$port" && ! { [[ "$port" == "$prev_port" ]] && container_running remnanode; }; then
+            err "Порт $port уже занят:"
+            ss -tlnpH "sport = :$port" 2>/dev/null | sed 's/^/    /'
+            def_port=""
+            continue
+        fi
+        break
     done
     dim "Тот же порт должен стоять в записи ноды в панели."
 
@@ -635,7 +989,7 @@ step_remnanode() {
 
     # ── Файлы ─────────────────────────────────────────────────────────────
     backup_file "$NODE_DIR/.env"
-    cat > "$NODE_DIR/.env" <<EOF
+    cat > "$NODE_DIR/.env" <<EOF || { err "Не удалось записать $NODE_DIR/.env"; return 1; }
 ### NODE ###
 NODE_PORT=$port
 
@@ -646,7 +1000,7 @@ EOF
     ok "Записан $NODE_DIR/.env"
 
     backup_file "$NODE_DIR/docker-compose.yml"
-    cat > "$NODE_DIR/docker-compose.yml" <<EOF
+    cat > "$NODE_DIR/docker-compose.yml" <<EOF || { err "Не удалось записать $NODE_DIR/docker-compose.yml"; return 1; }
 services:
   remnanode:
     container_name: remnanode
@@ -703,7 +1057,12 @@ EOF
         warn "Порт $port не слушается — панель до ноды не достучится"
     fi
 
-    if node_compose logs --tail 200 2>&1 | grep -qi 'unknown sni'; then
+    # Логи сперва в переменную: в пайпе grep -q выходит на первом совпадении,
+    # compose ловит SIGPIPE, и pipefail делал условие ложным — ровно тогда,
+    # когда ошибка в логах есть.
+    local logs
+    logs=$(node_compose logs --tail 200 2>&1) || true
+    if grep -qi 'unknown sni' <<<"$logs"; then
         err "В логах есть 'unknown sni' — панель старее ноды"
         dim "Переустановите с тегом 3.2.2 либо обновите панель."
     fi
@@ -715,20 +1074,18 @@ EOF
 # Шаг 6. Selfsteal + предварительная подготовка acme.sh
 # ─────────────────────────────────────────────────────────────────────────────
 prepare_acme() {
-    # Известная проблема: selfsteal.sh при первой установке acme.sh
-    # генерирует случайный e-mail вида user12345@<hostname>. Если у хоста
-    # короткое имя (stellar-gecko), адрес невалиден и Let's Encrypt
-    # отказывает в регистрации аккаунта. Ставим acme.sh заранее сами,
-    # с настоящим e-mail — тогда selfsteal увидит готовую установку
-    # и не пойдёт по сломанной ветке.
-    banner "Подготовка acme.sh (обход ошибки регистрации аккаунта)"
+    # Готовые установщики ставили acme.sh со случайным e-mail вида
+    # user12345@<hostname>; при коротком имени хоста (stellar-gecko) адрес
+    # невалиден, и Let's Encrypt отказывал в регистрации аккаунта. Поэтому
+    # ставим acme.sh сами, с настоящим e-mail, и регистрируемся явно.
+    banner "Подготовка acme.sh"
 
     local acme_home="$HOME/.acme.sh"
     local email=""
 
     while true; do
-        ask_var email "E-mail для Let's Encrypt (реальный, на него шлют уведомления об истечении):" "${ACME_EMAIL:-}"
-        [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[a-zA-Z]{2,}$ ]] && break
+        ask_var email "E-mail для Let's Encrypt (реальный адрес — на него регистрируется аккаунт):" "${ACME_EMAIL:-}"
+        [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] && valid_domain "${email#*@}" && break
         err "Некорректный e-mail. Нужен вид name@domain.tld"
     done
     ACME_EMAIL="$email"
@@ -768,51 +1125,183 @@ prepare_acme() {
     return 0
 }
 
+# Значение ключа из конфига домена acme.sh (Le_Webroot='...').
+acme_conf_value() {
+    grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- | sed "s/^'//; s/'\$//"
+}
+
+# Покрывает ли сертификат домен (по SAN, с учётом wildcard) и действует ли
+# он ещё хотя бы MARGIN секунд.
+cert_ok() {
+    local crt="$1" domain="$2" margin="${3:-0}"
+    [[ -s "$crt" ]] || return 1
+    openssl x509 -in "$crt" -noout -checkend "$margin" >/dev/null 2>&1 || return 1
+    openssl x509 -in "$crt" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match'
+}
+
+# Копия конфига acme.sh в бэкапы. У RSA- и ECC-конфигов одно имя файла
+# ($domain.conf), поэтому в имя бэкапа входит каталог.
+backup_acme_conf() {
+    local c="$1" dst
+    [[ -f "$c" ]] || return 0
+    mkdir -p "$BACKUP_DIR" || return 1
+    dst="$BACKUP_DIR/acme-$(basename "$(dirname "$c")").conf.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$c" "$dst" && dim "Бэкап: $dst"
+}
+
+# Снимает с автопродления запись acme.sh. Файлы сертификата acme.sh не
+# удаляет, конфиг переименовывает в .removed.
+acme_remove() {
+    local acme="$1" c="$2" d
+    d=$(acme_conf_value "$c" Le_Domain)
+    [[ -n "$d" ]] || return 1
+    backup_acme_conf "$c"
+    if [[ "$(basename "$(dirname "$c")")" == *_ecc ]]; then
+        "$acme" --remove -d "$d" --ecc >>"$LOG_FILE" 2>&1
+    else
+        "$acme" --remove -d "$d" >>"$LOG_FILE" 2>&1
+    fi
+}
+
 # Выпуск и установка сертификата. HTTP-01 через webroot, а не TLS-ALPN:
 # 443 занят Xray под REALITY, и продление по ALPN туда просто не забиндится.
 # Webroot обслуживает наш же nginx на 80, поэтому продление не требует
 # останова чего-либо и работает само из крона acme.sh.
+#
+# Сертификат всегда ведёт acme.sh: просто скопированный файл никто бы не
+# продлевал. Если acme.sh уже ведёт сертификат домена (наш прошлый запуск
+# или прежний установщик), заново не выпускаем — у Let's Encrypt лимит
+# 5 одинаковых сертификатов в неделю. Но продление идёт тем способом,
+# каким сертификат выпущен: standalone на 80 или TLS-ALPN на 443 теперь
+# не пройдут, поэтому такой сертификат один раз перевыпускаем через наш
+# webroot. DNS-01 портов не касается — его оставляем как есть.
 issue_cert() {
-    local domain="$1" acme="$HOME/.acme.sh/acme.sh"
+    local domain="$1" acme="$HOME/.acme.sh/acme.sh" webroot="$SS_DIR/acme"
     [[ -x "$acme" ]] || { err "acme.sh не найден"; return 1; }
+    mkdir -p "$SS_DIR/ssl" "$webroot/.well-known/acme-challenge" \
+        || { err "Не удалось создать каталоги в $SS_DIR"; return 1; }
 
-    mkdir -p "$SS_DIR/ssl" "$SS_DIR/acme/.well-known/acme-challenge"
+    # Ведём ECC-сертификат (умолчание acme.sh 3.x). --ecc указываем явно,
+    # чтобы не подхватить старый RSA-каталог того же домена.
+    local dir="$HOME/.acme.sh/${domain}_ecc"
+    local conf="$dir/$domain.conf" rc=0 method="" kl="" bak="" mark=0
 
-    # Действующий сертификат от прежней установки лучше переиспользовать:
-    # у Let's Encrypt лимит 5 одинаковых сертификатов в неделю.
-    local old
-    for old in /opt/nginx-selfsteal/ssl /opt/caddy/ssl; do
-        [[ -f "$old/fullchain.crt" && -f "$old/private.key" ]] || continue
-        openssl x509 -in "$old/fullchain.crt" -noout -checkend 604800 >/dev/null 2>&1 || continue
-        openssl x509 -in "$old/fullchain.crt" -noout -subject 2>/dev/null | grep -q "$domain" || continue
-        info "Беру действующий сертификат из $old"
-        cp -a "$old/fullchain.crt" "$SS_DIR/ssl/fullchain.crt"
-        cp -a "$old/private.key"   "$SS_DIR/ssl/private.key"
-        ok "Сертификат переиспользован, выпуск не нужен"
-        return 0
-    done
+    # Возврат к домену, который раньше сняли с продления при смене домена:
+    # acme.sh переименовал его конфиг в .removed, а ключ домена остался.
+    if [[ ! -f "$conf" && -f "$conf.removed" ]]; then
+        mv "$conf.removed" "$conf" || { err "Не удалось вернуть конфиг acme.sh для $domain"; return 1; }
+    fi
+    if [[ -f "$conf" ]]; then
+        method=$(acme_conf_value "$conf" Le_Webroot)
+        kl=$(acme_conf_value "$conf" Le_Keylength)
+    fi
+    # Длину ключа берём прежнюю: иначе acme.sh создаст новый ключ ещё до
+    # заказа, и при неудаче прежний сертификат остался бы без своего ключа.
+    [[ "$kl" == ec-* ]] || kl=ec-256
+    local issue=("$acme" --issue -d "$domain" --keylength "$kl" --webroot "$webroot" --server letsencrypt)
 
-    info "Выпускаю сертификат через HTTP-01 (webroot на порту 80)..."
-    "$acme" --issue -d "$domain" --webroot "$SS_DIR/acme" \
-        --server letsencrypt >>"$LOG_FILE" 2>&1 \
-        || { err "Выпуск не удался, хвост лога:"; tail -15 "$LOG_FILE" | sed 's/^/    /'; return 1; }
+    if [[ -f "$conf" && "$method" == "$webroot" ]]; then
+        info "acme.sh уже ведёт сертификат для $domain — продлеваю, если пора..."
+        "$acme" --renew -d "$domain" --ecc >>"$LOG_FILE" 2>&1 || rc=$?
+    elif [[ -f "$conf" && "$method" == dns_* ]]; then
+        info "acme.sh ведёт сертификат для $domain через DNS ($method) — оставляю этот способ"
+        "$acme" --renew -d "$domain" --ecc >>"$LOG_FILE" 2>&1 || rc=$?
+    elif [[ -f "$conf" ]]; then
+        warn "acme.sh ведёт сертификат для $domain другим способом: $method"
+        dim "Так продление больше не пройдёт: 80 занимает наш nginx, 443 — Xray. Перевыпускаю один раз через webroot."
+        # acme.sh перепишет конфиг домена (способ, хуки) ещё до заказа у CA
+        # и при неудаче не откатит. Сохраняем, чтобы вернуть рабочий способ.
+        backup_acme_conf "$conf"
+        bak="$conf.bootstrap-bak"
+        cp -p "$conf" "$bak" || { err "Не удалось сохранить $conf"; return 1; }
+        mark=$(wc -l <"$LOG_FILE" 2>/dev/null) || mark=0
+        "${issue[@]}" --force >>"$LOG_FILE" 2>&1 || rc=$?
+        if (( rc == 0 )); then
+            rm -f "$bak"; bak=""
+            # Порт TLS-ALPN от прежнего выпуска acme.sh не стирает, а обёртка
+            # продления selfsteal.sh по нему перенаправляет весь входящий 443.
+            sed -i '/^Le_TLSPort=/d' "$conf" 2>/dev/null || true
+        fi
+    else
+        info "Выпускаю сертификат через HTTP-01 (webroot на порту 80)..."
+        "${issue[@]}" >>"$LOG_FILE" 2>&1 || rc=$?
+    fi
 
-    # --reloadcmd выполняется и при каждом автопродлении из крона acme.sh.
-    "$acme" --install-cert -d "$domain" \
+    # 2 — RENEW_SKIP: сертификат есть и продлевать рано. Это не ошибка.
+    if (( rc != 0 && rc != 2 )); then
+        err "Выпуск не удался (код $rc), хвост лога:"
+        tail -15 "$LOG_FILE" | sed 's/^/    /'
+        if [[ -n "$bak" ]]; then
+            # Лог в переменную: grep -q в пайпе под pipefail «не находит» найденное.
+            local new_log
+            new_log=$(tail -n +"$((mark + 1))" "$LOG_FILE" 2>/dev/null) || new_log=""
+            if grep -qiE 'rateLimited|too many certificates' <<<"$new_log" \
+                && cert_ok "$dir/fullchain.cer" "$domain" 86400; then
+                rm -f "$bak"
+                warn "Let's Encrypt упёрся в лимит. Ставлю прежний действующий сертификат — его продлит крон через webroot"
+            else
+                if mv -f "$bak" "$conf"; then
+                    warn "Вернул прежний способ продления: $method"
+                else
+                    err "Не удалось вернуть конфиг acme.sh — прежний лежит в $bak"
+                fi
+                return 1
+            fi
+        elif [[ -f "$conf" ]] && cert_ok "$dir/fullchain.cer" "$domain" 86400; then
+            # Продлить не вышло, но прежний сертификат действует — ставим его,
+            # крон acme.sh попробует снова.
+            warn "Ставлю действующий сертификат acme.sh — продление крон повторит сам"
+        else
+            return 1
+        fi
+    fi
+
+    # Кладёт файлы туда, откуда их читает nginx, и запоминает пути и
+    # reloadcmd для каждого автопродления из крона acme.sh. reload, а не
+    # restart: перезапуск контейнера пересоздаёт сокет и рвёт соединения.
+    "$acme" --install-cert -d "$domain" --ecc \
         --key-file       "$SS_DIR/ssl/private.key" \
         --fullchain-file "$SS_DIR/ssl/fullchain.crt" \
-        --reloadcmd      "docker restart $SS_CONTAINER >/dev/null 2>&1 || true" \
+        --reloadcmd      "docker exec $SS_CONTAINER nginx -s reload >/dev/null 2>&1 || docker restart $SS_CONTAINER >/dev/null 2>&1 || true" \
         >>"$LOG_FILE" 2>&1 \
         || { err "install-cert не удался, смотрите $LOG_FILE"; return 1; }
 
-    ok "Сертификат выпущен и установлен"
+    cert_ok "$SS_DIR/ssl/fullchain.crt" "$domain" \
+        || { err "Установленный сертификат не подходит к $domain или уже истёк"; return 1; }
+    ok "Сертификат для $domain на месте, продление ведёт acme.sh"
+
+    # selfsteal.sh удалял из crontab строку acme.sh --cron и ставил свою
+    # обёртку в /opt/nginx-selfsteal — с удалением каталога продление бы
+    # встало. --install-cronjob идемпотентен: добавит строку, только если её нет.
+    "$acme" --install-cronjob >>"$LOG_FILE" 2>&1 \
+        || warn "Не удалось поставить крон acme.sh — сертификат не будет продлеваться сам, смотрите $LOG_FILE"
+
+    # Другие записи acme.sh, которые ставят файлы туда же: сертификат домена
+    # до смены на шаге 4 (слушатель на 80 — default_server, так что он
+    # продлевался бы и дальше, затирая наш) и RSA-сертификат этого же домена
+    # от прежнего установщика. Снимаем их с продления.
+    local c rd
+    for c in "$HOME"/.acme.sh/*/*.conf; do
+        [[ -f "$c" && "$c" != "$conf" && "$c" != *.csr.conf ]] || continue
+        if [[ "$(acme_conf_value "$c" Le_RealFullChainPath)" == "$SS_DIR/ssl/fullchain.crt" \
+              || "$(acme_conf_value "$c" Le_RealKeyPath)" == "$SS_DIR/ssl/private.key" \
+              || "$c" == "$HOME/.acme.sh/$domain/$domain.conf" ]]; then
+            rd=$(acme_conf_value "$c" Le_Domain)
+            if acme_remove "$acme" "$c"; then
+                dim "Сертификат $rd ($(basename "$(dirname "$c")")) снят с автопродления"
+            else
+                warn "Не удалось снять $c с автопродления — продлеваясь, он может затереть сертификат $domain"
+            fi
+        fi
+    done
+    return 0
 }
 
 # Конфиг только с портом 80: нужен, пока сертификата нет и основной
 # server-блок стартовать не может.
 write_acme_only_conf() {
     local domain="$1"
-    cat > "$SS_DIR/conf.d/acme-only.conf" <<EOF
+    cat > "$SS_DIR/conf.d/acme-only.conf" <<EOF || { err "Не удалось записать acme-only.conf"; return 1; }
 server {
     listen 80 default_server;
     server_name $domain;
@@ -822,12 +1311,41 @@ server {
 EOF
 }
 
+# Страница-заглушка. Её видит тот, кто пришёл на домен без ключа REALITY.
+# Берём стоковую «Welcome to nginx!» из того же образа: её отдают миллионы
+# свежих серверов, и ноду по ней не выделить. Прежняя своя заглушка была
+# одинаковой на всех установках этим скриптом — по её хешу ноды легко
+# собрать в один список.
+write_decoy_page() {
+    local f="$SS_DIR/html/index.html" cid rc=1
+    # Страницу пользователя не трогаем, старую заглушку скрипта заменяем.
+    if [[ -s "$f" ]] && ! grep -q 'Service is being set up' "$f"; then
+        return 0
+    fi
+    # Запасной копии страницы в скрипте нет намеренно: она отличалась бы от
+    # страницы в запущенном образе (текст меняется между версиями nginx).
+    # docker create сам скачает образ; docker cp сохраняет mtime файла из
+    # образа, а с ним Last-Modified и ETag, как у настоящего свежего nginx.
+    cid=$(docker create "nginx:$SS_NGINX_TAG" 2>>"$LOG_FILE") \
+        || { err "Не удалось получить образ nginx:$SS_NGINX_TAG — смотрите $LOG_FILE"; return 1; }
+    rm -f "$f.new"
+    docker cp "$cid:/usr/share/nginx/html/index.html" "$f.new" >>"$LOG_FILE" 2>&1 \
+        && [[ -s "$f.new" ]] && mv "$f.new" "$f" && rc=0
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+    (( rc == 0 )) || { rm -f "$f.new"; err "Не удалось взять страницу из образа nginx"; return 1; }
+}
+
 write_nginx_files() {
     local domain="$1"
     mkdir -p "$SS_DIR/conf.d" "$SS_DIR/html" "$SS_DIR/logs" "$SS_DIR/ssl" \
-             "$SS_DIR/acme/.well-known/acme-challenge"
+             "$SS_DIR/acme/.well-known/acme-challenge" \
+        || { err "Не удалось создать каталоги в $SS_DIR"; return 1; }
 
-    cat > "$SS_DIR/nginx.conf" <<'EOF'
+    # Хвосты прерванного выпуска: acme-only.conf рядом с selfsteal.conf дал бы
+    # два default_server на 80, и nginx бы не стартовал.
+    rm -f "$SS_DIR/conf.d/acme-only.conf" "$SS_DIR/conf.d/selfsteal.conf.pending"
+
+    cat > "$SS_DIR/nginx.conf" <<'EOF' || { err "Не удалось записать $SS_DIR/nginx.conf"; return 1; }
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log crit;
@@ -852,7 +1370,7 @@ http {
 }
 EOF
 
-    cat > "$SS_DIR/conf.d/selfsteal.conf" <<EOF
+    cat > "$SS_DIR/conf.d/selfsteal.conf" <<EOF || { err "Не удалось записать selfsteal.conf"; return 1; }
 # Порт 80: ACME-челлендж и редирект. Нужен для выпуска и продления
 # сертификата по HTTP-01 — 443 занят Xray, туда acme.sh не попадёт.
 server {
@@ -898,41 +1416,19 @@ server {
 }
 EOF
 
-    # Страница-заглушка. Её видит тот, кто пришёл на домен без ключа REALITY,
-    # поэтому выглядеть она должна как обычный скучный сайт.
-    if [[ ! -s "$SS_DIR/html/index.html" ]]; then
-        cat > "$SS_DIR/html/index.html" <<EOF
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>$domain</title>
-<style>
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#2b3440;background:#f6f7f9}
-main{max-width:34rem;padding:2rem;text-align:center}
-h1{font-size:1.5rem;font-weight:600;margin:0 0 .75rem}
-p{margin:0;color:#6b7684}
-</style>
-</head>
-<body>
-<main>
-<h1>Service is being set up</h1>
-<p>This site is not configured yet. Please check back later.</p>
-</main>
-</body>
-</html>
-EOF
-    fi
+    write_decoy_page || return 1
 
-    cat > "$SS_DIR/docker-compose.yml" <<EOF
+    cat > "$SS_DIR/docker-compose.yml" <<EOF || { err "Не удалось записать $SS_DIR/docker-compose.yml"; return 1; }
 services:
   nginx:
     image: nginx:$SS_NGINX_TAG
     container_name: $SS_CONTAINER
     restart: unless-stopped
     network_mode: host
+    # Сокет живёт в /dev/shm до перезагрузки хоста. После SIGKILL (docker kill,
+    # OOM, таймаут docker stop) nginx его не убирает, и следующий старт падает
+    # с "Address already in use" — поэтому перед запуском удаляем.
+    entrypoint: ["/bin/sh", "-c", "rm -f $SS_SOCKET && exec /docker-entrypoint.sh nginx -g 'daemon off;'"]
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./conf.d:/etc/nginx/conf.d:ro
@@ -960,7 +1456,15 @@ step_selfsteal() {
     banner "Шаг 6/10 — Selfsteal (nginx + unix socket)"
 
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
-    [[ -n "$DOMAIN" ]] || { err "Домен не задан — сначала пройдите шаг 4"; return 1; }
+    # Без домена шаг 6 невозможен, но пропущенный шаг 4 — осознанный выбор
+    # (другой target REALITY), а не ошибка: даём пропустить и этот шаг.
+    if [[ -z "$DOMAIN" ]]; then
+        warn "Домен не задан (шаг 4 пропущен) — без него selfsteal не настроить."
+        ask_yn "  Пропустить шаг 6?" y && { info "Пропускаю."; return 0; }
+        err "Сначала пройдите шаг 4 — запустите скрипт снова"
+        return 1
+    fi
+    valid_domain "$DOMAIN" || { err "Домен '$DOMAIN' некорректен — пройдите шаг 4 заново"; return 1; }
     info "Домен: $DOMAIN"
 
     printf '%snginx поднимается контейнером и слушает unix-сокет. TLS терминирует%s\n' "$C_DIM" "$C_RESET"
@@ -970,6 +1474,32 @@ step_selfsteal() {
         info "Пропускаю."; return 0
     fi
 
+    # Прежние установки, которые этот запуск остановил. Если дальше шаг не
+    # удастся, сокет останется без слушателя, а REALITY рвёт КАЖДОЕ входящее
+    # соединение, когда target недоступен, — нода легла бы целиком. Поэтому
+    # без работающего нашего nginx поднимаем прежнюю установку обратно.
+    local -a ss_stopped=()
+    local rc=0 d
+    selfsteal_setup || rc=$?
+    if (( ${#ss_stopped[@]} )) && ! container_running "$SS_CONTAINER"; then
+        # Наш контейнер мог остаться в цикле перезапусков: он держал бы 80, а
+        # его entrypoint удалял бы сокет, который создаст прежний nginx.
+        [[ -f "$SS_DIR/docker-compose.yml" ]] && { ss_compose down >>"$LOG_FILE" 2>&1 || true; }
+        for d in "${ss_stopped[@]}"; do
+            warn "Шаг не завершён — поднимаю обратно прежнюю установку $d, иначе REALITY останется без target"
+            if docker compose -f "$d/docker-compose.yml" --project-directory "$d" up -d >>"$LOG_FILE" 2>&1; then
+                ok "$d снова работает"
+            else
+                err "Не удалось поднять $d — нода без REALITY target! Вручную: cd $d && docker compose up -d"
+            fi
+        done
+    fi
+    return "$rc"
+}
+
+# Тело шага 6. Остановленные прежние установки дописывает в ss_stopped
+# вызывающего (step_selfsteal).
+selfsteal_setup() {
     have docker || { err "Нужен Docker — пройдите шаг 5"; return 1; }
 
     # Повторная проверка: DNS мог не успеть распространиться на шаге 4.
@@ -984,14 +1514,22 @@ step_selfsteal() {
     fi
 
     # Установка от внешнего скрипта держит и порт 80, и тот же сокет.
-    local old_dir
+    local old_dir running
     for old_dir in /opt/nginx-selfsteal /opt/caddy; do
         [[ -f "$old_dir/docker-compose.yml" ]] || continue
+        # Остановленную прошлым запуском не трогаем — и не поднимаем при неудаче.
+        running=$(docker compose -f "$old_dir/docker-compose.yml" --project-directory "$old_dir" \
+                  ps -q --status running --status restarting 2>/dev/null) || running=""
+        if [[ -z "$running" ]]; then
+            dim "Прежняя установка $old_dir уже остановлена"
+            continue
+        fi
         warn "Найдена прежняя установка: $old_dir"
         dim "Она занимает порт 80 и тот же сокет — вместе они не уживутся."
         if ask_yn "  Остановить её?" y; then
             docker compose -f "$old_dir/docker-compose.yml" --project-directory "$old_dir" down \
                 >>"$LOG_FILE" 2>&1 || true
+            ss_stopped+=("$old_dir")
             ok "Прежний контейнер остановлен, файлы в $old_dir не тронуты"
         else
             err "Продолжать без остановки нельзя"
@@ -999,47 +1537,55 @@ step_selfsteal() {
         fi
     done
 
-    if port_busy 80; then
-        warn "Порт 80 занят — ACME-челлендж не пройдёт:"
+    # Наш же nginx с прошлого запуска держит 80 и сам обслуживает челлендж —
+    # это не помеха. Мешает только чужой процесс.
+    if port_busy 80 && ! container_running "$SS_CONTAINER"; then
+        warn "Порт 80 занят сторонним процессом — ACME-челлендж не пройдёт:"
         ss -tlnp "sport = :80" 2>/dev/null | sed 's/^/    /'
         ask_yn "  Продолжить?" n || return 0
     fi
 
     prepare_acme || { err "acme.sh не готов"; return 1; }
 
-    write_nginx_files "$DOMAIN"
+    write_nginx_files "$DOMAIN" || return 1
 
-    # Пока сертификата нет, основной server-блок не стартует: nginx падает
-    # на отсутствующем ssl_certificate. Поэтому сперва поднимаем только
-    # слушатель на 80, выпускаем сертификат, потом включаем всё.
-    if [[ ! -f "$SS_DIR/ssl/fullchain.crt" ]]; then
+    # Без файлов сертификата основной server-блок не стартует: nginx падает
+    # на отсутствующем ssl_certificate. Тогда сперва поднимаем только
+    # слушатель на 80, выпускаем сертификат, потом включаем всё. Если файлы
+    # есть, nginx стартует с ними, а issue_cert всё равно сверит сертификат
+    # с доменом и сроком: домен могли сменить на шаге 4.
+    local bootstrap=0
+    if [[ ! -s "$SS_DIR/ssl/fullchain.crt" || ! -s "$SS_DIR/ssl/private.key" ]]; then
+        bootstrap=1
         info "Сертификата нет — временно поднимаю только слушатель на 80"
-        mv "$SS_DIR/conf.d/selfsteal.conf" "$SS_DIR/conf.d/selfsteal.conf.pending"
-        write_acme_only_conf "$DOMAIN"
-        ss_compose up -d >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся"; return 1; }
-        sleep 2
+        mv "$SS_DIR/conf.d/selfsteal.conf" "$SS_DIR/conf.d/selfsteal.conf.pending" \
+            && write_acme_only_conf "$DOMAIN" || return 1
+    fi
+    ss_compose up -d --force-recreate >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся, смотрите $LOG_FILE"; return 1; }
+    sleep 2
 
-        if ! issue_cert "$DOMAIN"; then
-            mv "$SS_DIR/conf.d/selfsteal.conf.pending" "$SS_DIR/conf.d/selfsteal.conf"
-            rm -f "$SS_DIR/conf.d/acme-only.conf"
-            err "Сертификат не выпущен"
-            return 1
-        fi
+    local issued=0
+    issue_cert "$DOMAIN" && issued=1
 
+    if (( bootstrap )); then
         rm -f "$SS_DIR/conf.d/acme-only.conf"
         mv "$SS_DIR/conf.d/selfsteal.conf.pending" "$SS_DIR/conf.d/selfsteal.conf"
-    else
-        ok "Сертификат уже на месте: $SS_DIR/ssl/fullchain.crt"
+    fi
+    if (( ! issued )); then
+        err "Сертификат для $DOMAIN не получен"
+        # Без сертификата полный конфиг не стартует — не оставляем nginx
+        # перезапускаться по кругу.
+        (( bootstrap )) && ss_compose down >>"$LOG_FILE" 2>&1
+        return 1
     fi
 
     info "Поднимаю nginx..."
-    ss_compose up -d --force-recreate >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся"; return 1; }
+    ss_compose up -d --force-recreate >>"$LOG_FILE" 2>&1 || { err "nginx не поднялся, смотрите $LOG_FILE"; return 1; }
     sleep 2
 
     # ── Проверки ──────────────────────────────────────────────────────────
     printf '\n'
-    if docker ps --filter "name=$SS_CONTAINER" --filter status=running --format '{{.Names}}' \
-        | grep -qx "$SS_CONTAINER"; then
+    if container_running "$SS_CONTAINER"; then
         ok "Контейнер $SS_CONTAINER работает"
     else
         err "Контейнер не поднялся"
@@ -1047,12 +1593,8 @@ step_selfsteal() {
         return 1
     fi
 
-    if [[ -f "$SS_DIR/ssl/fullchain.crt" ]]; then
-        ok "Сертификат: $SS_DIR/ssl/fullchain.crt"
-        openssl x509 -in "$SS_DIR/ssl/fullchain.crt" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
-    else
-        err "Файл сертификата отсутствует"
-    fi
+    ok "Сертификат: $SS_DIR/ssl/fullchain.crt"
+    openssl x509 -in "$SS_DIR/ssl/fullchain.crt" -noout -subject -enddate 2>/dev/null | sed 's/^/    /'
 
     [[ -S "$SS_SOCKET" ]] && ok "Unix-сокет $SS_SOCKET создан" \
         || err "Сокет $SS_SOCKET отсутствует — REALITY target не заработает"
@@ -1073,7 +1615,9 @@ step_selfsteal() {
 # Шаг 7. WARP, вариант B
 # ─────────────────────────────────────────────────────────────────────────────
 install_wgcf() {
-    have wgcf && { ok "wgcf уже установлен: $(wgcf --version 2>&1 | head -1)"; return 0; }
+    # Флага --version у wgcf нет (корневая команда cobra без Version), так
+    # что проверяем только наличие бинарника.
+    have wgcf && { ok "wgcf уже установлен: $(command -v wgcf)"; return 0; }
 
     local arch
     case "$(uname -m)" in
@@ -1082,10 +1626,18 @@ install_wgcf() {
         *) err "Архитектура $(uname -m) не поддерживается wgcf"; return 1 ;;
     esac
 
+    # Версию берём из API, а если его лимит (60 запросов в час на IP — на
+    # общих адресах VPS выбирается быстро) исчерпан, из редиректа
+    # releases/latest на страницу тега.
     local ver
     ver=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
           | grep -o '"tag_name": *"[^"]*' | cut -d'"' -f4) || true
-    [[ -n "$ver" ]] || { err "Не удалось узнать версию wgcf (GitHub API недоступен?)"; return 1; }
+    if [[ -z "$ver" ]]; then
+        ver=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+              https://github.com/ViRb3/wgcf/releases/latest 2>/dev/null) || true
+        ver="${ver##*/tag/}"
+    fi
+    [[ "$ver" =~ ^v[0-9][0-9.]*$ ]] || { err "Не удалось узнать версию wgcf (GitHub недоступен?)"; return 1; }
 
     local tmp
     tmp=$(mktemp -d)
@@ -1098,10 +1650,13 @@ install_wgcf() {
     # уже на регистрации, где причина будет неочевидна.
     [[ -s "$tmp/wgcf" ]] || { rm -rf "$tmp"; err "Скачанный wgcf пуст"; return 1; }
     chmod +x "$tmp/wgcf"
-    if ! "$tmp/wgcf" --version >/dev/null 2>&1; then
+    # --help печатает справку и выходит с 0. --version тут не годится:
+    # такого флага нет, и проверка падала на любом хосте.
+    # Запуск из $tmp, чтобы wgcf не подхватил чужой wgcf-account.toml из cwd.
+    if ! (cd "$tmp" && ./wgcf --help >/dev/null 2>&1); then
         rm -rf "$tmp"; err "Скачанный wgcf не запускается на этой системе"; return 1
     fi
-    install -m 755 "$tmp/wgcf" /usr/local/bin/wgcf
+    install -m 755 "$tmp/wgcf" /usr/local/bin/wgcf || { rm -rf "$tmp"; err "Не удалось установить wgcf"; return 1; }
     rm -rf "$tmp"
     ok "wgcf $ver установлен"
 }
@@ -1118,32 +1673,82 @@ adapt_warp_profile() {
     # включая SSH-ответы и связь с панелью. С ним интерфейс просто
     # поднимается, а в туннель попадают только сокеты, привязанные к нему
     # через sockopt.interface.
-    grep -q '^Table = off' "$f" || sed -i '/^MTU =/a Table = off' "$f"
+    #
+    # Ставим сразу после [Interface], а не после MTU: строки MTU в профиле
+    # может не оказаться (другой формат, чужой профиль). Прежние Table
+    # убираем — wg-quick берёт последнее значение, и Table = auto ниже
+    # перекрыл бы наше.
+    sed -i -E '/^[[:space:]]*Table[[:space:]]*=/d' "$f"
+    sed -i '/^\[Interface\]/a Table = off' "$f"
 
     grep -q '^PersistentKeepalive' "$f" || sed -i '/^Endpoint =/a PersistentKeepalive = 25' "$f"
 
     # wgcf пишет IPv4 и IPv6 одной строкой Address. Если IPv6 на хосте
     # выключен, вырезаем только IPv6-токен, не трогая строку целиком.
-    if [[ ! -f /proc/net/if_inet6 ]]; then
+    if ipv6_disabled; then
         warn "IPv6 на хосте выключен — убираю IPv6 из профиля"
         sed -i -E 's#,[[:space:]]*[0-9A-Fa-f:]+/128##g' "$f"
         sed -i -E '/^AllowedIPs/ s#,[[:space:]]*::/0##' "$f"
     fi
 }
 
+# IPv6 выключен целиком (ipv6.disable=1 — тогда нет /proc/net/if_inet6) или
+# через sysctl disable_ipv6 — тогда файл на месте, но новый интерфейс warp
+# получит disable_ipv6 от default, и wg-quick упадёт на ip -6 address add
+# с 'Permission denied'.
+ipv6_disabled() {
+    [[ -f /proc/net/if_inet6 ]] || return 0
+    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == 1 ]] && return 0
+    [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" == 1 ]] && return 0
+    return 1
+}
+
+# Watchdog от wtm.sh (его ставили wtm install-warp и прежние версии этого
+# скрипта) перезапускает службу при любом inactive, в том числе после ручного
+# stop, и дублировал бы наш. Вызывать до перезапуска службы.
+remove_wtm_watchdog() {
+    [[ -f /etc/cron.d/wtm-warp-watchdog ]] || return 0
+    backup_file /etc/cron.d/wtm-warp-watchdog
+    pkill -f /opt/wtm/warp-watchdog.sh 2>/dev/null || true
+    rm -f /etc/cron.d/wtm-warp-watchdog /opt/wtm/warp-watchdog.sh /run/wtm-warp-watchdog.stamp
+    rmdir /opt/wtm 2>/dev/null || true
+    info "Убран watchdog от wtm.sh (/etc/cron.d/wtm-warp-watchdog) — его заменяет наш"
+}
+
 install_warp_watchdog() {
-    cat > /usr/local/bin/warp-watchdog <<'EOF'
+    cat > /usr/local/bin/warp-watchdog <<'EOF' || { err "Не удалось записать warp-watchdog"; return 1; }
 #!/usr/bin/env bash
-# Поднимает wg-quick@warp, если интерфейс пропал. Вариант B опирается на
-# то, что интерфейс есть: без него sockopt.interface отправит трафик в никуда.
-ip link show warp >/dev/null 2>&1 && exit 0
-logger -t warp-watchdog "интерфейс warp отсутствует, перезапускаю wg-quick@warp"
+# Перезапускает wg-quick@warp, если туннель не работает. Вариант B опирается
+# на живой интерфейс: без него sockopt.interface отправит трафик в никуда.
+# Создан remnanode-bootstrap.
+
+# Остановленную вручную службу не трогаем: systemctl disable или stop —
+# осознанное решение админа. "failed" — не решение, его поднимаем.
+systemctl is-enabled --quiet wg-quick@warp || exit 0
+[[ "$(systemctl is-active wg-quick@warp)" == inactive ]] && exit 0
+
+reason=""
+if ! ip link show warp >/dev/null 2>&1; then
+    reason="интерфейс warp отсутствует"
+else
+    # Частый отказ — интерфейс на месте, а Cloudflare не отвечает. При
+    # PersistentKeepalive handshake обновляется каждые ~2 минуты, так что
+    # старше 5 минут — туннель мёртв. 0 — handshake ещё не было, ждём.
+    hs=$(wg show warp latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    if [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 )); then
+        age=$(( $(date +%s) - hs ))
+        (( age > 300 )) && reason="handshake с Cloudflare не обновлялся ${age} с"
+    fi
+fi
+[[ -n "$reason" ]] || exit 0
+logger -t warp-watchdog "$reason, перезапускаю wg-quick@warp"
 systemctl restart wg-quick@warp
 EOF
     chmod 755 /usr/local/bin/warp-watchdog
-    printf '*/5 * * * * root /usr/local/bin/warp-watchdog\n' > /etc/cron.d/warp-watchdog
+    printf '*/5 * * * * root /usr/local/bin/warp-watchdog\n' > /etc/cron.d/warp-watchdog \
+        || { err "Не удалось записать /etc/cron.d/warp-watchdog"; return 1; }
     chmod 644 /etc/cron.d/warp-watchdog
-    ok "Watchdog установлен: проверка каждые 5 минут"
+    ok "Watchdog установлен: проверка каждые 5 минут (интерфейс и свежесть handshake)"
 }
 
 step_warp() {
@@ -1158,56 +1763,74 @@ step_warp() {
         info "Пропускаю."; return 0
     fi
 
+    local reuse=0
     if [[ -f "$WARP_CONFIG" ]]; then
         ok "Конфигурация WARP уже есть: $WARP_CONFIG"
-        if ! ask_yn "  Перерегистрировать аккаунт заново?" n; then
-            systemctl enable --now wg-quick@warp >>"$LOG_FILE" 2>&1 || true
-            verify_warp
-            state_mark "warp"
-            return 0
-        fi
+        ask_yn "  Перерегистрировать аккаунт заново?" n || reuse=1
     fi
 
+    # wireguard-tools, адаптация профиля и watchdog нужны и при повторном
+    # запуске: профиль мог остаться от wtm.sh или от прошлого прогона,
+    # упавшего сразу после его записи.
     info "Ставлю wireguard-tools..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y -qq wireguard-tools >/dev/null \
-        || { err "Не удалось поставить wireguard-tools"; return 1; }
+    apt_install wireguard-tools \
+        || { err "Не удалось поставить wireguard-tools, смотрите $LOG_FILE"; return 1; }
 
-    install_wgcf || return 1
+    if (( reuse )); then
+        info "Привожу существующий профиль к варианту B..."
+        backup_file "$WARP_CONFIG"
+        adapt_warp_profile "$WARP_CONFIG"
+    else
+        install_wgcf || return 1
 
-    local tmp
-    tmp=$(mktemp -d)
-    info "Регистрирую аккаунт WARP..."
-    # Современный wgcf требует явного согласия с условиями: старое
-    # `yes | wgcf register` больше не проходит.
-    if ! (cd "$tmp" && wgcf register --accept-tos >>"$LOG_FILE" 2>&1); then
+        local tmp
+        tmp=$(mktemp -d) || { err "mktemp не отработал"; return 1; }
+        info "Регистрирую аккаунт WARP..."
+        # Современный wgcf требует явного согласия с условиями: старое
+        # `yes | wgcf register` больше не проходит.
+        if ! (cd "$tmp" && wgcf register --accept-tos >>"$LOG_FILE" 2>&1); then
+            rm -rf "$tmp"
+            err "Регистрация в Cloudflare не удалась, смотрите $LOG_FILE"
+            dim "Часть дата-центров заблокирована на стороне Cloudflare."
+            return 1
+        fi
+        ok "Аккаунт зарегистрирован"
+
+        if ! (cd "$tmp" && wgcf generate >>"$LOG_FILE" 2>&1); then
+            rm -rf "$tmp"; err "wgcf generate не отработал"; return 1
+        fi
+        [[ -f "$tmp/wgcf-profile.conf" ]] || { rm -rf "$tmp"; err "Профиль не создан"; return 1; }
+
+        adapt_warp_profile "$tmp/wgcf-profile.conf"
+
+        mkdir -p /etc/wireguard
+        backup_file "$WARP_CONFIG"
+        if ! install -m 600 "$tmp/wgcf-profile.conf" "$WARP_CONFIG"; then
+            rm -rf "$tmp"; err "Не удалось записать $WARP_CONFIG"; return 1
+        fi
+        # В прежнем аккаунте device_id, access_token и, возможно, ключ WARP+ —
+        # без них старым устройством через wgcf уже не управлять.
+        backup_file "$WARP_ACCOUNT"
+        install -m 600 "$tmp/wgcf-account.toml" "$WARP_ACCOUNT" 2>/dev/null || true
         rm -rf "$tmp"
-        err "Регистрация в Cloudflare не удалась, смотрите $LOG_FILE"
-        dim "Часть дата-центров заблокирована на стороне Cloudflare."
+        ok "Профиль установлен: $WARP_CONFIG"
+    fi
+
+    # Без Table = off служба увела бы в WARP весь трафик сервера вместе с
+    # этой SSH-сессией — такой профиль не запускаем.
+    if ! grep -q '^Table = off' "$WARP_CONFIG"; then
+        err "В профиле нет Table = off — не запускаю: весь трафик сервера ушёл бы в WARP"
         return 1
     fi
-    ok "Аккаунт зарегистрирован"
+    ok "Table = off — маршрут по умолчанию остаётся прежним"
 
-    if ! (cd "$tmp" && wgcf generate >>"$LOG_FILE" 2>&1); then
-        rm -rf "$tmp"; err "wgcf generate не отработал"; return 1
-    fi
-    [[ -f "$tmp/wgcf-profile.conf" ]] || { rm -rf "$tmp"; err "Профиль не создан"; return 1; }
+    remove_wtm_watchdog
 
-    mkdir -p /etc/wireguard
-    adapt_warp_profile "$tmp/wgcf-profile.conf"
-
-    backup_file "$WARP_CONFIG"
-    install -m 600 "$tmp/wgcf-profile.conf" "$WARP_CONFIG"
-    install -m 600 "$tmp/wgcf-account.toml" "$WARP_ACCOUNT" 2>/dev/null || true
-    rm -rf "$tmp"
-    ok "Профиль установлен: $WARP_CONFIG"
-
-    grep -q '^Table = off' "$WARP_CONFIG" \
-        && ok "Table = off — маршрут по умолчанию остаётся прежним" \
-        || err "В профиле нет Table = off: весь трафик сервера уйдёт в WARP"
-
-    info "Поднимаю wg-quick@warp..."
-    if systemctl enable --now wg-quick@warp >>"$LOG_FILE" 2>&1; then
+    # restart, а не enable --now: уже запущенную службу --now не трогает,
+    # и после перерегистрации интерфейс жил бы со старыми ключами.
+    info "Запускаю wg-quick@warp..."
+    if systemctl enable wg-quick@warp >>"$LOG_FILE" 2>&1 \
+        && systemctl restart wg-quick@warp >>"$LOG_FILE" 2>&1; then
         ok "Служба запущена"
     else
         err "wg-quick@warp не запустился"
@@ -1215,8 +1838,8 @@ step_warp() {
         return 1
     fi
 
-    install_warp_watchdog
-    verify_warp
+    install_warp_watchdog || return 1
+    verify_warp || return 1
     state_mark "warp"
 }
 
@@ -1228,18 +1851,20 @@ verify_warp() {
     else
         err "Интерфейс warp не найден — вариант B работать не будет"
         dim "Диагностика: journalctl -u wg-quick@warp -n 30"
-        return 0
+        return 1
     fi
 
-    # Маршрут по умолчанию обязан остаться на физическом интерфейсе.
-    local defdev
-    defdev=$(ip route show default | awk '{print $5; exit}')
-    if [[ "$defdev" == "warp" ]]; then
-        err "Маршрут по умолчанию ушёл в warp — так не должно быть в варианте B"
-        dim "Проверьте Table = off в $WARP_CONFIG"
-    else
-        ok "Маршрут по умолчанию по-прежнему через ${defdev:-?}"
+    # Без Table = off wg-quick не трогает main-таблицу: он добавляет правило
+    # по fwmark и свою таблицу 51820, и `ip route show default` по-прежнему
+    # показывает eth0. Поэтому спрашиваем ядро, куда уйдёт обычный пакет.
+    local dev
+    dev=$(ip route get 1.1.1.1 2>/dev/null | grep -o 'dev [^ ]*' | awk '{print $2; exit}') || true
+    if [[ "$dev" == "warp" ]]; then
+        err "Обычный трафик сервера уходит в warp — в варианте B так быть не должно"
+        dim "Проверьте Table = off в $WARP_CONFIG и вывод ip rule"
+        return 1
     fi
+    ok "Обычный трафик идёт мимо WARP, через ${dev:-?}"
 
     local trace
     trace=$(curl --interface warp -sS --max-time 12 \
@@ -1256,13 +1881,26 @@ verify_warp() {
 # Шаг 8. Файрвол
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Порты, на которых реально слушает sshd. Берём из sshd -T, а не из конфига:
-# порт мог быть переопределён дропином, а закрыться от себя нельзя.
+# Порты, на которых реально слушает SSH, — закрыться от себя нельзя.
+# Под socket-активацией (Ubuntu 24.04) слушает systemd, и Port/ListenAddress
+# из конфига не действуют: порт задаёт ssh.socket (его меняют через
+# systemctl edit). Иначе — listenaddress из sshd -T: в нём уже итоговый
+# порт, и из Port, и из ListenAddress host:port, который Port не перекрывает.
+# Плюс порт, на который пришла текущая сессия. Пусто — ошибка, а не «22».
 ssh_ports() {
-    local p
-    p=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
-    [[ -n "$p" ]] || p=22
-    printf '%s\n' "$p"
+    local out ports="" c="${SSH_CONNECTION:-}"
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        ports=$(systemctl show -p Listen --value ssh.socket 2>/dev/null \
+            | awk '$2=="(Stream)"{n=split($1,a,":"); print a[n]}') || ports=""
+    fi
+    # Порт из sshd_config при socket-активации не действует — не открываем лишний.
+    if [[ -z "$ports" ]] && out=$(sshd_dump) && [[ -n "$out" ]]; then
+        ports+=$'\n'$(awk '$1=="listenaddress"{n=split($2,a,":"); print a[n]}' <<<"$out")
+    fi
+    [[ -n "$c" ]] && ports+=$'\n'"${c##* }"
+    ports=$(grep -E '^[0-9]+$' <<<"$ports" | sort -un) || ports=""
+    [[ -n "$ports" ]] || return 1
+    printf '%s\n' "$ports"
 }
 
 # Порт API ноды из .env. Новое имя NODE_PORT, старое APP_PORT.
@@ -1280,10 +1918,12 @@ node_port() {
 # не показывает вообще — добавленные, но не применённые лежат в `show added`.
 # Поэтому смотрим оба места: до включения работает первое, после — второе.
 ssh_rule_present() {
-    local port="$1"
-    ufw show added 2>/dev/null | grep -qE "allow[[:space:]]+(in[[:space:]]+)?${port}/tcp" && return 0
-    ufw status    2>/dev/null | grep -qE "^${port}/tcp" && return 0
-    return 1
+    local port="$1" out
+    # Вывод в переменную: grep -q в пайпе под pipefail может «не найти» найденное.
+    out=$(ufw show added 2>/dev/null) || out=""
+    grep -qE "allow[[:space:]]+(in[[:space:]]+)?${port}/tcp" <<<"$out" && return 0
+    out=$(ufw status 2>/dev/null) || out=""
+    grep -qE "^${port}/tcp" <<<"$out"
 }
 
 # Контейнеры с опубликованными наружу портами. Docker пишет свои правила
@@ -1293,6 +1933,37 @@ docker_published() {
     have docker || return 0
     docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
         | grep -E '0\.0\.0\.0:|\[::\]:' || true
+}
+
+# Пропускает ли tailscaled трафик тейлнета сам, мимо ufw. В режиме по
+# умолчанию (--netfilter-mode=on) он ставит переход в цепочку ts-input
+# первым правилом INPUT в таблице filter — той же, что у ufw через
+# iptables-nft, — а в ts-input лежат `-i tailscale0 -j ACCEPT` и
+# `-p udp --dport 41641 -j ACCEPT`. ufw запрещает трафик политикой цепочки,
+# а не явным DROP, поэтому эти ACCEPT срабатывают при любом порядке правил.
+tailscale_owns_input() {
+    iptables -C INPUT -j ts-input 2>/dev/null && return 0
+    have nft && nft list chain ip filter INPUT 2>/dev/null | grep -q 'jump ts-input'
+}
+
+is_tailnet_or_local() {
+    local ip="$1" a b
+    case "$ip" in
+        127.*|::1|fd7a:115c:a1e0:*) return 0 ;;
+    esac
+    IFS=. read -r a b _ <<<"$ip"
+    [[ "$a" == 100 && "$b" =~ ^[0-9]+$ ]] && (( b >= 64 && b <= 127 ))
+}
+
+# Адреса, с которых сейчас установлены соединения на порт ноды, кроме
+# тейлнета (100.64.0.0/10, fd7a:115c:a1e0::/48) и loopback. Обычно это панель.
+node_peers_outside_tailnet() {
+    local port="$1" peer ip
+    ss -Htn state established "( sport = :$port )" 2>/dev/null | awk '{print $4}' \
+        | while read -r peer; do
+            ip="${peer%:*}"; ip="${ip#[}"; ip="${ip%]}"; ip="${ip#::ffff:}"
+            is_tailnet_or_local "$ip" || printf '%s\n' "$ip"
+        done | sort -u
 }
 
 step_firewall() {
@@ -1310,14 +1981,19 @@ step_firewall() {
         ok "ufw уже установлен"
     else
         info "Ставлю ufw..."
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get install -y -qq ufw >/dev/null || { err "Не удалось поставить ufw"; return 1; }
+        apt_install ufw || { err "Не удалось поставить ufw, смотрите $LOG_FILE"; return 1; }
         ok "ufw установлен"
     fi
 
     # ── Собираем список портов ────────────────────────────────────────────
     local sshp
-    sshp=$(ssh_ports | tr '\n' ' ')
+    sshp=$(ssh_ports | tr '\n' ' ') || sshp=""
+    sshp="${sshp% }"
+    if [[ -z "$sshp" ]]; then
+        warn "Не удалось определить порт SSH: sshd -T не отработал, ssh.socket не активен"
+        ask_var sshp "Порт SSH, который открыть в ufw:" ""
+        [[ "$sshp" =~ ^[0-9]+$ ]] || { err "Без порта SSH ufw не включаю"; return 1; }
+    fi
     ok "SSH слушает порт(ы): $sshp"
 
     local nodep=""
@@ -1329,10 +2005,20 @@ step_firewall() {
         [[ "$nodep" =~ ^[0-9]+$ ]] || nodep=""
     fi
 
+    # tailscaled создаёт tailscale0 при старте, ещё до авторизации, так что
+    # интерфейс — не признак работающего тейлнета.
     local ts_if=""
     if ip link show tailscale0 >/dev/null 2>&1; then
         ts_if="tailscale0"
-        ok "Интерфейс тейлнета: tailscale0"
+        if tailscale status >/dev/null 2>&1; then
+            ok "Тейлнет подключён: $(tailscale ip -4 2>/dev/null | head -1)"
+        else
+            warn "tailscale0 есть, но Tailscale не подключён — доделайте: tailscale up --ssh"
+            if [[ -n "$nodep" ]]; then
+                err "Пока Tailscale не подключён, порт ноды $nodep закрыт для всех, включая панель."
+                ask_yn "  Всё равно продолжить?" n || return 0
+            fi
+        fi
     else
         warn "Интерфейс tailscale0 не найден — правил для тейлнета не будет"
         if [[ -n "$nodep" ]]; then
@@ -1341,9 +2027,36 @@ step_firewall() {
         fi
     fi
 
+    # ── Откуда к ноде ходит панель ────────────────────────────────────────
+    # Порт ноды останется открыт только на tailscale0. Если панель сейчас
+    # подключена по публичному адресу, после ufw enable нода молча уйдёт
+    # в офлайн.
+    if [[ -n "$nodep" ]]; then
+        local outside
+        outside=$(node_peers_outside_tailnet "$nodep")
+        if [[ -n "$outside" ]]; then
+            warn "К порту ноды $nodep сейчас подключены не из тейлнета:"
+            printf '%s\n' "$outside" | sed 's/^/    /'
+            dim "Скорее всего это панель. После включения ufw она потеряет связь с нодой."
+            dim "Укажите в панели адрес ноды из тейлнета (tailscale ip -4) и запустите шаг снова."
+            ask_yn "  Всё равно продолжить?" n || return 0
+        fi
+    fi
+
+    # ── Tailscale и ufw ───────────────────────────────────────────────────
+    local ts_open=0
+    if [[ -n "$ts_if" ]] && tailscale_owns_input; then
+        ts_open=1
+        printf '\n'
+        warn "tailscaled сам пропускает весь входящий трафик тейлнета и 41641/udp — раньше правил ufw."
+        dim "Ограничить устройства тейлнета одним портом ufw здесь не может: это делается"
+        dim "ACL в админке Tailscale — https://login.tailscale.com/admin/acls"
+        dim "Правила ufw для tailscale0 ниже всё равно добавятся — на случай --netfilter-mode=off."
+    fi
+
     # ── Область правила для тейлнета ──────────────────────────────────────
     local ts_wide="n"
-    if [[ -n "$ts_if" ]]; then
+    if [[ -n "$ts_if" ]] && (( ! ts_open )); then
         printf '\n%sДоступ из тейлнета можно открыть двумя способами:%s\n' "$C_DIM" "$C_RESET"
         dim "  узко — только порт ноды${nodep:+ ($nodep)}; всё остальное закрыто и внутри тейлнета"
         dim "  широко — любой порт этого сервера доступен вашим устройствам в тейлнете"
@@ -1352,7 +2065,9 @@ step_firewall() {
 
     # ── Входящий 41641/udp ────────────────────────────────────────────────
     local ts_udp="n"
-    if [[ -n "$ts_if" ]]; then
+    if [[ -n "$ts_if" ]] && (( ts_open )); then
+        ts_udp="y"   # tailscaled его уже открыл; правило ufw — на случай --netfilter-mode=off
+    elif [[ -n "$ts_if" ]]; then
         printf '\n%sTailscale слушает UDP 41641 для прямых соединений между пирами.%s\n' "$C_DIM" "$C_RESET"
         dim "Закрыть можно: связь сохранится, но при неудачной пробивке NAT"
         dim "трафик пойдёт через DERP-релеи — лишняя задержка и чужой сервер в пути."
@@ -1365,7 +2080,7 @@ step_firewall() {
     dim "default deny incoming / allow outgoing"
     local p
     for p in $sshp; do dim "allow $p/tcp                      (SSH)"; done
-    dim "allow 80/tcp                       (HTTP, выпуск сертификата)"
+    dim "allow 80/tcp                       (HTTP-01: выпуск и продление сертификата)"
     dim "allow 443/tcp                      (VLESS REALITY, selfsteal)"
     if [[ -n "$ts_if" ]]; then
         if [[ "$ts_wide" == "y" ]]; then
@@ -1374,6 +2089,7 @@ step_firewall() {
             dim "allow in on tailscale0 port $nodep    (только API ноды)"
         fi
         [[ "$ts_udp" == "y" ]] && dim "allow 41641/udp                    (прямые соединения Tailscale)"
+        (( ts_open )) && dim "(сейчас tailscaled и так пропускает тейлнет целиком, см. выше)"
     fi
     printf '\n'
 
@@ -1387,10 +2103,11 @@ step_firewall() {
     done
     ok "SSH разрешён: $sshp"
 
-    ufw default deny incoming  >/dev/null
-    ufw default allow outgoing >/dev/null
-    ufw allow 80/tcp  comment 'http acme'   >/dev/null
-    ufw allow 443/tcp comment 'vless reality' >/dev/null
+    { ufw default deny incoming  >/dev/null \
+        && ufw default allow outgoing >/dev/null \
+        && ufw allow 80/tcp  comment 'http acme'   >/dev/null \
+        && ufw allow 443/tcp comment 'vless reality' >/dev/null; } \
+        || { err "Не удалось задать базовые правила ufw — не включаю"; return 1; }
     ok "Открыты 80 и 443"
 
     if [[ -n "$ts_if" ]]; then
@@ -1407,14 +2124,16 @@ step_firewall() {
         fi
     fi
 
-    # Проверяем, что правило для SSH действительно есть. Без него включение
-    # ufw обрывает текущую сессию и запирает нас снаружи.
-    local first_ssh; first_ssh=${sshp%% *}
-    if ! ssh_rule_present "$first_ssh"; then
-        err "Правило для SSH не найдено — НЕ включаю ufw"
-        ufw show added 2>/dev/null | sed 's/^/    /'
-        return 1
-    fi
+    # Проверяем, что правило для SSH действительно есть — для каждого порта.
+    # Без него включение ufw запирает нас снаружи.
+    local sp
+    for sp in $sshp; do
+        if ! ssh_rule_present "$sp"; then
+            err "Правило для SSH-порта $sp не найдено — НЕ включаю ufw"
+            ufw show added 2>/dev/null | sed 's/^/    /'
+            return 1
+        fi
+    done
     ok "Правило для SSH на месте"
 
     ufw --force enable >/dev/null || { err "ufw enable вернул ошибку"; return 1; }
@@ -1423,12 +2142,16 @@ step_firewall() {
     # После включения правило обязано быть видно уже в status. Если его нет —
     # выключаем немедленно, пока текущая сессия жива: established-соединения
     # ufw пропускает, но новый вход был бы невозможен.
-    if ! ufw status | grep -qE "^$first_ssh/tcp"; then
-        err "После включения правило для SSH не видно в ufw status — выключаю ufw обратно"
-        ufw disable >/dev/null 2>&1 || true
-        ufw status | sed 's/^/    /'
-        return 1
-    fi
+    local st
+    st=$(ufw status 2>/dev/null) || st=""
+    for sp in $sshp; do
+        if ! grep -qE "^$sp/tcp" <<<"$st"; then
+            err "После включения правило для SSH-порта $sp не видно в ufw status — выключаю ufw обратно"
+            ufw disable >/dev/null 2>&1 || true
+            ufw status | sed 's/^/    /'
+            return 1
+        fi
+    done
 
     # ── Проверка результата ───────────────────────────────────────────────
     printf '\n'
@@ -1446,9 +2169,11 @@ step_firewall() {
     if [[ -n "$nodep" ]]; then
         # Правило порта ноды обязано быть привязано к интерфейсу. Строка
         # без "on tailscale0" означает, что порт открыт всему интернету.
-        if ufw status | grep -E "(^|[[:space:]])$nodep(/tcp)?[[:space:]]" | grep -qv 'on tailscale0'; then
+        local node_rules
+        node_rules=$(ufw status 2>/dev/null | grep -E "(^|[[:space:]])$nodep(/tcp)?[[:space:]]") || node_rules=""
+        if grep -qv 'on tailscale0' <<<"$node_rules" && [[ -n "$node_rules" ]]; then
             err "Порт ноды $nodep разрешён не только на tailscale0 — проверьте вывод выше"
-            ufw status | grep -E "(^|[[:space:]])$nodep" | sed 's/^/    /'
+            printf '%s\n' "$node_rules" | sed 's/^/    /'
         else
             ok "Порт ноды $nodep снаружи закрыт"
         fi
@@ -1509,11 +2234,16 @@ step_bbr() {
     # Чтобы модуль был на месте и после перезагрузки, до применения sysctl.
     echo tcp_bbr > /etc/modules-load.d/bbr.conf
 
-    cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+    cat > /etc/sysctl.d/99-bbr.conf <<'EOF' || { err "Не удалось записать /etc/sysctl.d/99-bbr.conf"; return 1; }
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
-    sysctl --system >/dev/null 2>&1
+    # Только свой файл: sysctl --system возвращает ошибку, если не применился
+    # хоть один ключ из любого файла системы (устаревший tcp_tw_recycle в
+    # sysctl.conf, read-only ключи в LXC/OpenVZ), и под set -e это обрывало
+    # весь скрипт. Что применилось на самом деле — проверяем ниже.
+    sysctl -p /etc/sysctl.d/99-bbr.conf >>"$LOG_FILE" 2>&1 \
+        || warn "Не все ключи применились (в LXC/OpenVZ default_qdisc обычно read-only), подробности в $LOG_FILE"
 
     local cc qd
     cc=$(sysctl -n net.ipv4.tcp_congestion_control)
@@ -1526,12 +2256,30 @@ EOF
     local dev
     dev=$(ip route show default | awk '{print $5; exit}')
     if [[ -n "$dev" ]]; then
-        if tc qdisc replace dev "$dev" root fq 2>/dev/null; then
+        local root_kind parent qd_ok=1
+        root_kind=$(tc qdisc show dev "$dev" 2>/dev/null | awk '/ root /{print $2; exit}')
+        if [[ "$root_kind" == mq ]]; then
+            # Многоочередная карта (virtio-net с несколькими очередями): под mq
+            # свой qdisc на каждую очередь. Меняем их, а не корень — fq в корне
+            # свёл бы весь трафик в одну очередь. У mq, поставленного ядром,
+            # handle 0, а по parent :N дочерние не адресуются (ядро не ищет
+            # qdisc с handle 0). Поэтому сначала даём mq handle 1: — дочерние
+            # при этом пересоздаются из default_qdisc, уже fq, — а затем
+            # явно ставим fq на 1:N на случай, если default_qdisc не применился.
+            tc qdisc replace dev "$dev" root handle 1: mq 2>/dev/null || qd_ok=0
+            for parent in $(tc qdisc show dev "$dev" 2>/dev/null \
+                    | awk '{for (i = 1; i < NF; i++) if ($i == "parent") print $(i + 1)}'); do
+                tc qdisc replace dev "$dev" parent "$parent" fq 2>/dev/null || qd_ok=0
+            done
+        else
+            tc qdisc replace dev "$dev" root fq 2>/dev/null || qd_ok=0
+        fi
+        if (( qd_ok )); then
             ok "На $dev применён fq без перезагрузки"
         else
             warn "Не удалось сменить qdisc на $dev — fq вступит в силу после перезагрузки"
         fi
-        dim "Сейчас: $(tc qdisc show dev "$dev" 2>/dev/null | head -1)"
+        dim "Сейчас: $(tc qdisc show dev "$dev" 2>/dev/null | awk '{print $2}' | sort | uniq -c | xargs)"
     fi
 
     dim "Проверить на живых соединениях: ss -tin | grep -c bbr"
@@ -1549,21 +2297,27 @@ step_xhttp() {
     DOMAIN="${DOMAIN:-$(cat "$STATE_DIR/domain" 2>/dev/null || true)}"
 
     printf '%sXHTTP добавляется вторым инбаундом рядом с уже работающим REALITY.%s\n' "$C_DIM" "$C_RESET"
-    printf '%sОн слушает абстрактный unix-сокет внутри контейнера, порт не занимает%s\n' "$C_DIM" "$C_RESET"
-    printf '%sи nginx не задействует: трафик приходит к нему через fallback.%s\n\n' "$C_DIM" "$C_RESET"
+    printf '%sОн слушает абстрактный unix-сокет, TCP-порт не занимает и nginx%s\n' "$C_DIM" "$C_RESET"
+    printf '%sне задействует: трафик приходит к нему через fallback.%s\n\n' "$C_DIM" "$C_RESET"
+    dim "При network_mode: host абстрактный сокет виден всему хосту, а прав доступа"
+    dim "у таких сокетов нет. Чужих он всё равно не пустит: VLESS проверяет UUID."
+    printf '\n'
 
     if ! ask_yn "Сгенерировать конфигурацию XHTTP?" y; then
         info "Пропускаю."; return 0
     fi
 
-    local path tag sock="@xhttp"
+    local path="" tag sock="@xhttp" out="$STATE_DIR/xhttp-inbound.json"
+    # При повторе предлагаем прежний путь: он уже стоит в ссылках клиентов.
+    [[ -f "$out" ]] && path=$(sed -n 's#.*"path": *"/\([^"]*\)".*#\1#p' "$out" 2>/dev/null | head -1)
     # Путь не секрет, но угадываемый путь упрощает активное прощупывание.
-    path=$(openssl rand -hex 8 2>/dev/null) || path=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    [[ -n "$path" ]] || path=$(openssl rand -hex 8 2>/dev/null) \
+        || path=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     ask_var path "Путь XHTTP (без ведущего слэша):" "$path"
     path="${path#/}"
     ask_var tag "Тег инбаунда:" "VLESS-XHTTP"
 
-    local out="$STATE_DIR/xhttp-inbound.json"
+    backup_file "$out"
     cat > "$out" <<EOF
 {
   "tag": "$tag",
@@ -1614,7 +2368,7 @@ EOF
     dim "Непрошедший проверку REALITY трафик как и раньше уходит в nginx."
     dim "Конфигурация nginx не меняется, порт не добавляется."
 
-    if [[ -n "$DOMAIN" ]]; then
+    if [[ -n "$DOMAIN" ]] && valid_domain "$DOMAIN"; then
         printf '\n%sКлиентская ссылка соберётся в панели сама. Её узнаваемые части:%s\n' "$C_DIM" "$C_RESET"
         dim "type=xhttp  mode=stream-up  path=/$path  security=reality  sni=$DOMAIN"
     fi
@@ -1634,13 +2388,22 @@ summary() {
     banner "Готово"
 
     printf '%sЧто сделано:%s\n' "$C_BOLD" "$C_RESET"
+    local k
     for k in system ssh tailscale dns remnanode selfsteal warp firewall bbr xhttp; do
-        if state_done "$k"; then
+        if step_failed "$k"; then
+            printf '  %s✗%s %s %s(ошибка в этом запуске — подробности выше и в логе)%s\n' \
+                "$C_RED" "$C_RESET" "$k" "$C_DIM" "$C_RESET"
+        elif state_done "$k"; then
             printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$k"
         else
             printf '  %s·%s %s %s(пропущено)%s\n' "$C_DIM" "$C_RESET" "$k" "$C_DIM" "$C_RESET"
         fi
     done
+    if ((${#FAILED_STEPS[@]})); then
+        printf '\n'
+        warn "Не завершены шаги: ${FAILED_STEPS[*]}. Исправьте причину и запустите скрипт снова —"
+        dim "пройденные шаги он предложит пропустить."
+    fi
 
     printf '\n%sОсталось сделать вручную — в панели Remnawave:%s\n' "$C_BOLD" "$C_RESET"
     printf '\n1. Добавьте ноду, если ещё не добавлена, и убедитесь, что она online.\n'
@@ -1667,7 +2430,8 @@ JSON
     dim "rn restart                  — перезапуск ноды"
     dim "warp-watchdog               — поднять warp, если упал"
     dim "systemctl status wg-quick@warp"
-    dim "sshd -T | grep -i password  — проверить, что пароль отключён"
+    dim "sshd -T -C $SSHD_TEST_SPEC,lport=22 | grep -iE 'password|kbdinteractive|permitroot'"
+    dim "                            — пароль для root с учётом Match-блоков"
     dim "curl --interface warp https://www.cloudflare.com/cdn-cgi/trace"
 
     printf '\n%sЛог установки: %s%s\n' "$C_DIM" "$LOG_FILE" "$C_RESET"
@@ -1687,19 +2451,32 @@ main() {
     printf '\n%sБудут выполнены 10 шагов. Каждый можно пропустить.%s\n' "$C_DIM" "$C_RESET"
     ask_yn "Начинаем?" y || { info "Отменено."; exit 0; }
 
-    step_system
-    step_ssh
-    step_tailscale
-    step_dns
-    step_remnanode
-    step_selfsteal
-    step_warp
-    # Шаг может вернуть ненулевой код (например, отказался включать ufw).
-    # Без || это под set -e обрывает весь скрипт вместе с оставшимися шагами.
-    step_firewall || warn "Шаг файрвола не завершён — подробности выше"
-    step_bbr
-    step_xhttp
+    # Через run_step: неудача одного шага не отменяет остальные. Раньше
+    # return 1, например, из шага WARP обрывал скрипт до файрвола.
+    run_step system    step_system
+    run_step ssh       step_ssh
+    run_step tailscale step_tailscale
+    run_step dns       step_dns
+    run_step remnanode step_remnanode
+    run_step selfsteal step_selfsteal
+    run_step warp      step_warp
+    run_step firewall  step_firewall
+    run_step bbr       step_bbr
+    run_step xhttp     step_xhttp
     summary
+
+    ((${#FAILED_STEPS[@]} == 0)) || exit 1
 }
 
-main "$@"
+# Без терминала (ssh host 'cmd' без -t, cloud-init, cron) каждый read из
+# /dev/tty падает: вопросы молча получали ответ по умолчанию — скрипт ставил
+# пакеты и Tailscale без спроса, — а циклы ввода крутились бесконечно.
+if ! { : </dev/tty; } 2>/dev/null; then
+    err "Нет терминала: скрипт интерактивный. Подключитесь с ssh -t или из обычной SSH-сессии."
+    exit 1
+fi
+
+# stdin для всего скрипта и дочерних процессов — терминал. Иначе при запуске
+# через пайп (curl | bash) apt или dpkg могли бы прочитать из stdin кусок
+# текста самого скрипта.
+main "$@" </dev/tty
